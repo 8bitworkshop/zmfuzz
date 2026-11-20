@@ -98,7 +98,8 @@ pub fn run(mut master: Search, opts: Options, ui: Tui) -> Search {
     let mut sync_snapshot = master.to_checkpoint();
     // Workers load the snapshot only on their first job and after a sync. On
     // ordinary batches they keep their own state, so counters and
-    // `stablecount` accumulate instead of being reset every ten games.
+    // `stablecount` accumulate; each batch reports the change since its
+    // baseline and the master *adds* it.
     let mut needs_sync = vec![true; threads];
 
     for (index, job_tx) in job_txs.iter().enumerate() {
@@ -270,10 +271,13 @@ fn worker(
         let mut checkpoint = search.to_checkpoint();
         let current = search.counter_snapshot();
         for stat in &mut checkpoint.stats {
-            if let Some(&(count, runs, succ)) = baseline.get(&stat.token) {
+            if let Some(&(count, runs, succ, stable)) = baseline.get(&stat.token) {
                 stat.count = stat.count.saturating_sub(count);
                 stat.goalruns = stat.goalruns.saturating_sub(runs);
                 stat.goalsucc = stat.goalsucc.saturating_sub(succ);
+                // Signed: a missed goal subtracts two, so this delta can be
+                // negative even while the counter stays at or above zero.
+                stat.stablecount = stat.stablecount.saturating_sub(stable);
             }
         }
         baseline = current;

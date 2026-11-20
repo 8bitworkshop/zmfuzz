@@ -2,7 +2,8 @@
 
 A shortest-path-to-every-atom fuzzer for Z-machine story files: it plays a game
 over and over, records the command sequence that first produced each piece of
-output, then aims the next game at whatever it has seen least.
+output, then aims the next game at the cheapest goal according to a priority
+function (see [How it works](#how-it-works)).
 
 This is a Rust port of `search.js` from
 [sehugg's fork of zzo38's JSZM](https://github.com/sehugg/jszm)
@@ -41,7 +42,7 @@ zmfuzz <story.z3> [options]
   --threads N    worker threads (default 1)
   --batch N      games per worker before reporting/merging (default 10)
   --sync N       re-share merged knowledge every N games (0 = end only, default 1000)
-  --checkpoint F read/write search state at F (default ./<story>.save)
+  --checkpoint F read/write search state at F (default ./<story file name>.save)
   --fresh        ignore an existing checkpoint and start a blank search
   --no-events    ignore VM side effects (text tokens only)
   --stats        print aggregate search metrics (implies quiet run lines)
@@ -96,13 +97,80 @@ text never seen before — are mined as word templates. A later turn can take on
 of those commands and mutate a single slot, which is much more likely to parse
 than two random dictionary words.
 
+## Architecture
+
+There is one search core and two drivers. Everything that crosses a process or
+thread boundary is a `Checkpoint`; everything that plays a game is a `Search`.
+
+| module | job |
+| --- | --- |
+| `src/main.rs` | argument parsing, story load, sequential driver, final report, `--stats` |
+| `src/search.rs` | the search core: goal selection, priority, command generation, replay/`hackvm`, tokenizing, per-turn commit |
+| `src/parallel.rs` | worker threads and the coordinator; batches are exchanged as `Checkpoint`s |
+| `src/checkpoint.rs` | JSON persistence plus `load` / `merge` / `merge_delta` |
+| `src/stat.rs` | `Stat`, `Playthrough`, `Turn`, and `Score` (the goal-queue ordering key) |
+| `src/token.rs` | token interner: `TokenId` -> `Rc<str>` |
+| `src/labels.rs` | object table -> readable names, player-object detection |
+| `src/ui.rs` | `TokenUI`, the one-token-per-print-chunk UI |
+| `src/tui.rs` | crossterm live display (panes, keys, worker rows) |
+| `src/rng.rs` | xorshift64* |
+
+The data flow for one game:
+
+```text
+main
+  -> Search::new(story, seed, turns)
+  -> load_checkpoint (default; --fresh skips it)
+  -> run_sequential(search) or parallel::run(search, workers)
+       search.play_game()
+         newgame()            pick a goal, reset per-game state, stretch budget
+         machine()            fresh Zmachine + TokenUI + per-game RNG seed
+         run_to_input()       step the VM until it asks for a line
+         loop
+           committurn()       fold the previous turn into Stat / tokfreq / best
+           choose_command()   replay a known path, else template/random words
+           handle_input(cmd)
+           run_to_input()
+         endgame()            demote an unmet goal; checkpoint every 10k games
+```
+
+Output arrives by two channels, both drained once per turn in `collect_turn`:
+
+- `TokenUI::drain_prints()` yields one string per print opcode chunk. `logprint`
+  turns it into a text token (truncated to `wordtoklen`) and also collects
+  dictionary words the turn made usable as commands.
+- `Zmachine::drain_events()` yields typed `VmEvent`s (`Move`, `Store`,
+  `PutProp`, `GetProp`, `Flag`, `Random`). `apply_event` turns the recorded ones
+  into `@mv_` / `@pp_` / `@f_` tokens. `Store` is logged only when
+  `record_stores` is on, and `GetProp` / `Random` are ignored, matching `search.js`.
+
+Knowledge lives in `Search`:
+
+- `tokens`: the interner. The raw string is the identity; labels are display
+  only and are never fed back into the search.
+- `stats: HashMap<TokenId, Stat>`: one record per token, the `alltokstats` of
+  the JS version.
+- `tokfreq: BTreeSet<Score>`: the goal queue. `Score` orders by priority value
+  first and token name second, so the queue is stable across processes even
+  though ids are not.
+- `stabletoks` / `stableorder`: the stable set and its promotion order.
+- `vmtoks`: stable `@mv_` tokens that are not ambient, used by `hackvm`.
+- `vocab` / `vocabdict`: the story dictionary (sorted by `get_dictionary`).
+- `cmdtemplates`: commands that produced a useful turn, in memory only.
+
+`Stat` is the per-token record. `count` is how many turns contained the token;
+`goalruns` / `goalsucc` are attempts and verified successes; `first` is the
+earliest turn index it appeared at; `best` is a snapshot of the playthrough up
+to `first`; `stablecount` drives promotion; `maxscore` and additive `goalruns`
+drive the score bonus (`score_tries` is telemetry); `cmds` are the commands that
+first produced it.
+
 ## How it works
 
-Per token, `alltokstats` keeps: how many turns it appeared in, how many times it
-was the goal (`goalruns`), how many of those games met it (`goalsucc`), the
-earliest turn index it showed up at (`first`), the playthrough snapshot that
-reaches it (`best`), a stability counter, and the best score seen while it was
-the goal.
+Per token, `Stat` keeps: how many turns it appeared in, how many times it was
+the goal (`goalruns`), how many of those games met it (`goalsucc`), the earliest
+turn index it showed up at (`first`), the playthrough snapshot that reaches it
+(`best`), a stability counter, and the best score seen while it was the goal.
 
 A game (`play_game`) picks a **goal** at random from the ten most attractive
 tokens, then plays up to `maxturns` turns. One game in five (`prob_explore`)
@@ -128,26 +196,27 @@ Priority (lower is more attractive):
 first * 1 + ln(1+goalruns) * 4 - ln(1+goalsucc) * 2
   + fails * (fails / (goalruns+1)) * 10
   + stable * 1000
-  - maxscore * 100 / (1 + score_tries / 5)
+  - min(150, maxscore * 15 / (1 + goalruns / 5))
 ```
 
-where `fails = goalruns - goalsucc` and `score_tries` counts goal attempts since
-`maxscore` last improved. The failure term is weighted by the failure *rate*, so
-a goal that occasionally succeeds is not punished like one that never does. The
-score bonus decays with failed attempts: a lucky score run is chased for a while,
-then released instead of pinning the same ten goals forever. Legacy checkpoints
-without `score_tries` load with `max(goalruns, 20)`, so old score bonuses start
-out decayed.
+where `fails = goalruns - goalsucc`. The failure term is weighted by the failure
+*rate*, so a goal that occasionally succeeds is not punished like one that never
+does. The score decay rides on `goalruns`, which is additive across workers, and
+the bonus is capped at 150 so a single lucky scored run cannot pin the queue.
+`score_tries` is still recorded as telemetry, but it is not part of the
+priority. See [`PLATEAU-DIAGNOSIS.md`](PLATEAU-DIAGNOSIS.md) for the measurements
+that led to this formula.
 
-Saturating the run/success counts stops one token from dominating; the score term
-is what makes a scored path crowd out everything else while it is still fresh.
+A success updates the goal's priority immediately, not only when it becomes
+stable, so the queue reflects `goalsucc` as soon as it changes.
 
 **Deep goals**: the linear `first` term in the priority makes a token first seen
 at turn 300 unattractive, so a known-but-unreproduced path can otherwise sit in
 the queue forever. Three story-agnostic mechanisms counter that:
 
-- 8% of games (`prob_frontier`) target the deepest token that has a known `best`
-  path and has never been reproduced as a goal;
+- 8% of games (`prob_frontier`) target the deepest non-stable token that has a
+  known `best` path, including ones that have succeeded once or twice but are
+  still short of their threshold;
 - if the chosen goal's `first` (or path length) is beyond `--turns`, that game
   gets a stretched budget, up to 4x the normal turn limit, so the route is
   reachable;
@@ -155,9 +224,6 @@ the queue forever. Three story-agnostic mechanisms counter that:
   retrying only the command that originally produced the token. A path found by
   a random game is still a path until it diverges, which still abandons the
   replay for that game.
-
-A success updates the goal's priority immediately, not only when it becomes
-stable, so the queue reflects `goalsucc` as soon as it changes.
 
 **VM hacking**: when the chosen goal is stable, with probability
 `stablecount/10` the game starts with an object moved somewhere it cannot
@@ -175,10 +241,14 @@ they exchange only plain checkpoints.
   original seed, so `--threads 1` is the old single-threaded, reproducible run.
 - Workers play `--batch` games at a time and report back. Workers keep their
   own state between batches; only a sync reloads a master snapshot. Each batch
-  reports `count` / `goalruns` / `goalsucc` as *deltas* from that worker's
-  baseline, and the coordinator adds them. Every game belongs to exactly one
-  worker, so the merged counters are real global totals rather than a max over
-  workers. Paths, `first`, scores and the stable set still merge best-of-either.
+  reports `count` / `goalruns` / `goalsucc` / `stablecount` as *deltas* from
+  that worker's baseline, and the coordinator adds them. Every game belongs to
+  exactly one worker, so those merged counters are real global totals rather
+  than a max over workers. `stablecount` is signed because a missed goal
+  subtracts two. The coordinator also promotes (or demotes) from the *summed*
+  `stablecount`, so several workers that are each one success short still cross
+  the threshold together. Paths, `first`, scores and the stable set merge
+  best-of-either.
 - Every `--sync` games the merged snapshot is handed back to workers, so what
   one thread discovers steers the others. `--sync 0` makes the workers fully
   independent until the final merge.
@@ -218,10 +288,17 @@ are not useful with the display.
 
 ## Checkpoints
 
-`--checkpoint` writes `{numplays, stabletoks, stats[]}` as JSON, with best paths
-included, on exit and every 10,000 games. A `score_tries` field records how many
-attempts have passed since the token's best score, so score decay survives a
-resume. If the file exists it is loaded back at startup — tokens are re-interned
+`--checkpoint` writes `{format_version, numplays, stabletoks, stats[], run_meta}`
+as JSON, with best paths included, on exit and every 10,000 games. The file is
+ignored by git (`.gitignore` has `*.z3.save`); delete it or pass `--fresh` for a
+blank search. `run_meta` records the thread count, sync interval, code version
+and play count, so a stuck blob can be explained after the fact. `score_tries`
+is kept for telemetry; score decay uses `goalruns`, which survives a merge.
+Checkpoints written before `stablecount` became additive (no `format_version`, or
+version 1) are repaired on load: `stablecount` is reconstructed from
+`3 * goalsucc - 2 * goalruns` and the stable set is re-derived. The file is
+rewritten at the current `format_version` on exit. If the
+file exists it is loaded back at startup — tokens are re-interned
 and the goal queue rebuilt — so knowledge accumulates across invocations without
 retyping `--resume`. The random stream
 is reseeded at `seed + numplays`, so each invocation explores new games instead
@@ -242,7 +319,9 @@ which is why a resumed search picks the same goals in the same order.
 per-run lines are suppressed): new tokens per 1,000 turns, useful and
 state-changing command rates, state changes per turn, replay divergence,
 average path length, goal-queue health (negative priorities, never-targeted
-tokens, top-ten/exploration/frontier shares), and checkpoint size.
+tokens, top-ten/exploration/frontier shares), score-tries and score-bonus
+medians/maxima, the `goalsucc/stablecount` ratio (near the thread count means
+stability is being max-merged), and checkpoint size.
 `tools/bench.sh` is a reproducible wrapper — fresh checkpoint, one thread, fixed seed — so an A/B can
 be a plain `diff`:
 
@@ -252,6 +331,18 @@ tools/bench.sh minizork.z3 400 200 1 > before.txt
 tools/bench.sh minizork.z3 400 200 1 > after.txt
 diff before.txt after.txt
 ```
+
+## Plateau fixes
+
+The 72k-play Mini-Zork checkpoint used to be stuck: almost every stable token was
+first seen on turn 0-2 and the top ten goals were the same already-scored
+cellar/painting cluster. Three changes address it: `stablecount` is now summed
+across workers (and the coordinator promotes from the summed value), score decay
+uses additive `goalruns` instead of min-merged `score_tries`, and the score bonus
+is rescaled (`scoremult` 15) and capped at 150. Old checkpoints are repaired on
+load, and `--stats` reports the diagnostics that make a recurrence visible. The
+measurements and root-cause analysis are in
+[`PLATEAU-DIAGNOSIS.md`](PLATEAU-DIAGNOSIS.md).
 
 ## Parity with search.js
 
@@ -265,13 +356,13 @@ Deliberately different:
 
 | search.js | here | why |
 | --- | --- | --- |
-| fixed priority formula | failure penalty + decaying score + 20% exploration | ten score-6 goals could otherwise pin the queue forever |
+| fixed priority formula | failure penalty + capped, goalrun-decayed score + 20% exploration | ten score-6 goals could otherwise pin the queue forever |
 | every `@mv_*` is a goal | player moves and inventory pickups only; NPC moves are ambient | chasing the thief is not actionable |
 | one goal credited per run | verified replays also credit discoveries on their prefix | one run validates many goals |
 | random dictionary words | mined command templates, one slot mutated | fewer parser errors per turn |
 | `Math.random()` | xorshift64* | V8 seeds from entropy; both are reproducible, but not against each other |
 | hangs if the game never reads | `step_with_budget` gives up, run marked `stuck` | a fuzzer should not wedge |
-| writes `monkey.z3.save` next to the story | `./monkey.z3.save` | don't scribble in `encrusted-heart/tests` |
+| writes `monkey.z3.save` next to the story | `./<story file name>.save` in the working directory | don't scribble in `encrusted-heart/tests` |
 | `flatted` checkpoint | JSON | no cyclic graphs to worry about |
 | save/restore ask for a file name | in-memory save slot | no interactive input available |
 | dictionary in `Map` order | dictionary sorted | `get_dictionary()` sorts; word choice is random either way |
@@ -294,7 +385,9 @@ tools/compare.sh minizork.z3 15     # side-by-side with search.js (needs node + 
 ```
 
 `encrusted-heart` has its own interpreter conformance suite (`tests/*.regtest`);
-`zmfuzz` only checks the search layer.
+`zmfuzz` only checks the search layer. The merge tests cover both idempotent
+`merge` and the additive `merge_delta` used by the threaded driver, including
+stable promotion from the summed counter and legacy-checkpoint repair.
 
 # License
 MIT; see `LICENSE`. `encrusted-heart` is linked as a path dependency and is

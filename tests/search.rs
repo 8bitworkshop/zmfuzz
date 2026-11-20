@@ -313,14 +313,13 @@ fn score_bonus_decays_and_failures_push_goals_down() {
     use std::collections::HashMap;
     use zmfuzz::stat::Stat;
 
-    let make = |first, goalruns, goalsucc, maxscore, score_tries| {
+    let make = |first, goalruns, goalsucc, maxscore| {
         let mut stat = Stat::new("x".to_string());
         stat.first = first;
         stat.count = goalruns * 5;
         stat.goalruns = goalruns;
         stat.goalsucc = goalsucc;
         stat.maxscore = maxscore;
-        stat.score_tries = score_tries;
         stat
     };
 
@@ -330,12 +329,13 @@ fn score_bonus_decays_and_failures_push_goals_down() {
     let cold = search.tokens.intern("score-cold").0;
     let plain = search.tokens.intern("score-plain").0;
     search.set_stats(HashMap::from([
-        (fresh, make(4, 5, 2, 6, 0)),
-        // Same score and history, but many attempts without improving it.
-        (aged, make(4, 5, 2, 6, 200)),
+        (fresh, make(4, 5, 5, 6)),
+        // Same score and success rate, but many attempts since it improved:
+        // the decay now rides on additive `goalruns`, not `score_tries`.
+        (aged, make(4, 200, 200, 6)),
         // A goal that has never succeeded: the failure penalty should bury it.
-        (cold, make(5, 20, 0, 0, 0)),
-        (plain, make(5, 0, 0, 0, 0)),
+        (cold, make(5, 20, 0, 0)),
+        (plain, make(5, 0, 0, 0)),
     ]));
     search.reindex();
 
@@ -352,6 +352,156 @@ fn score_bonus_decays_and_failures_push_goals_down() {
         pf
     );
     assert!(pc > pf, "never-succeeding goal was not penalized");
+}
+
+fn delta_checkpoint(
+    token: &str,
+    first: usize,
+    runs: u64,
+    succ: u64,
+    stablecount: i64,
+    maxscore: i64,
+    score_tries: u64,
+) -> zmfuzz::checkpoint::Checkpoint {
+    use zmfuzz::checkpoint::{Checkpoint, PersistStat, CHECKPOINT_VERSION};
+
+    Checkpoint {
+        format_version: CHECKPOINT_VERSION,
+        numplays: 0,
+        stabletoks: Vec::new(),
+        stats: vec![PersistStat {
+            token: token.to_string(),
+            count: runs * 5,
+            goalruns: runs,
+            goalsucc: succ,
+            first,
+            cmds: vec!["look".to_string()],
+            stablecount,
+            maxscore,
+            score_tries,
+            best: None,
+        }],
+        run_meta: None,
+    }
+}
+
+#[test]
+fn stablecount_is_additive_and_promotes_on_the_merged_value() {
+    let mut search = Search::new(story("minizork.z3"), 1, 20, false);
+    // first = 5 means the threshold is 5 * (5 + 1) = 30. Neither worker adds
+    // enough on its own; their sum does.
+    search.merge_delta(delta_checkpoint("merged-goal", 5, 20, 20, 20, 0, 0));
+    let id = search.tokens.get("merged-goal").unwrap();
+    assert_eq!(search.stat(id).stablecount, 20);
+    assert_eq!(search.stable_count(), 0, "promoted below the threshold");
+
+    search.merge_delta(delta_checkpoint("merged-goal", 5, 15, 15, 15, 0, 0));
+    assert_eq!(search.stat(id).stablecount, 35);
+    assert_eq!(
+        search.stable_count(),
+        1,
+        "the summed counter crossed the threshold but was not promoted"
+    );
+
+    // A negative delta (a missed goal subtracts two) must subtract, not max.
+    search.merge_delta(delta_checkpoint("merged-goal", 5, 0, 0, -2, 0, 0));
+    assert_eq!(search.stat(id).stablecount, 33);
+}
+
+#[test]
+fn merged_score_tries_does_not_reset_to_a_stale_zero() {
+    let mut search = Search::new(story("minizork.z3"), 1, 20, false);
+    search.merge_delta(delta_checkpoint("scored", 5, 1, 1, 0, 6, 250));
+    let id = search.tokens.get("scored").unwrap();
+    assert_eq!(search.stat(id).score_tries, 250);
+
+    // Another worker that has not targeted the token reports zero. That must
+    // not rewind the clock.
+    search.merge_delta(delta_checkpoint("scored", 5, 1, 1, 0, 6, 0));
+    assert_eq!(search.stat(id).score_tries, 250);
+}
+
+#[test]
+fn score_bonus_is_capped_and_the_queue_rotates() {
+    use std::collections::HashMap;
+    use zmfuzz::stat::Stat;
+
+    let make = |first, goalruns, goalsucc, maxscore| {
+        let mut stat = Stat::new("x".to_string());
+        stat.first = first;
+        stat.count = goalruns * 5;
+        stat.goalruns = goalruns;
+        stat.goalsucc = goalsucc;
+        stat.maxscore = maxscore;
+        stat
+    };
+
+    let mut search = Search::new(story("minizork.z3"), 1, 20, false);
+    let mut stats = HashMap::new();
+    for index in 0..15 {
+        let id = search.tokens.intern(&format!("scored-{:02}", index)).0;
+        stats.insert(id, make(37, 500, 490, 42));
+    }
+    let reachable = search.tokens.intern("reachable-frontier").0;
+    stats.insert(reachable, make(36, 1, 0, 0));
+    let deep = search.tokens.intern("deep-brand-new-score").0;
+    stats.insert(deep, make(238, 0, 0, 25));
+    search.set_stats(stats);
+    search.reindex();
+
+    let queue = search.goal_queue();
+    let top10: Vec<String> = queue
+        .iter()
+        .take(10)
+        .map(|(_, id)| search.token_name(*id).to_string())
+        .collect();
+
+    assert!(
+        top10.iter().any(|name| name == "reachable-frontier"),
+        "the already-scored cluster still pins the queue: {:?}",
+        top10
+    );
+    assert!(
+        !top10.iter().any(|name| name == "deep-brand-new-score"),
+        "one new deep score immediately pinned the queue: {:?}",
+        top10
+    );
+}
+
+#[test]
+fn legacy_checkpoints_repair_undercounted_stability() {
+    use zmfuzz::checkpoint::{Checkpoint, PersistStat};
+
+    // Version 0 is what the max-merged production blobs say. `stablecount` 20
+    // is below the first=5 threshold of 30 even though every attempt succeeded.
+    let legacy = Checkpoint {
+        format_version: 0,
+        numplays: 10_000,
+        stabletoks: Vec::new(),
+        stats: vec![PersistStat {
+            token: "legacy-goal".to_string(),
+            count: 1000,
+            goalruns: 100,
+            goalsucc: 100,
+            first: 5,
+            cmds: vec!["look".to_string()],
+            stablecount: 20,
+            maxscore: 0,
+            score_tries: 0,
+            best: None,
+        }],
+        run_meta: None,
+    };
+
+    let mut search = Search::new(story("minizork.z3"), 1, 20, false);
+    search.load(legacy);
+
+    let id = search.tokens.get("legacy-goal").unwrap();
+    assert_eq!(search.stat(id).stablecount, 100);
+    assert!(
+        search.stabletok_ids().contains(&id),
+        "repaired counter did not become stable"
+    );
 }
 
 #[test]

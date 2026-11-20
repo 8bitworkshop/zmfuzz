@@ -90,8 +90,9 @@ pub struct Stat {
     pub stablecount: i64,
     /// Best score seen while this token was the goal.
     pub maxscore: i64,
-    /// Goal attempts since `maxscore` last improved. Used to decay the score
-    /// bonus so one lucky run cannot pin a token to the top of the queue.
+    /// Goal attempts since `maxscore` last improved. Kept as telemetry only:
+    /// the score bonus decays on `goalruns`, which merges additively across
+    /// workers, so a fresh zero from one worker cannot reset the clock.
     pub score_tries: u64,
     /// Snapshot of the playthrough up to `first`, once known.
     pub best: Option<Vec<Turn>>,

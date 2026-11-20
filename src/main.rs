@@ -233,6 +233,11 @@ fn main() {
         }
     }
 
+    search.run_meta.threads = args.threads;
+    search.run_meta.sync = args.sync;
+    search.run_meta.version = env!("CARGO_PKG_VERSION").to_string();
+    search.run_meta.plays = search.numplays;
+
     println!(
         "zmfuzz: v{} story, {} games of {} turns, seed {}, {} thread{}",
         search.version(),
@@ -325,6 +330,20 @@ fn main() {
                 stable,
                 score
             );
+            // The total alone hid a ~4000-point score term; print the terms
+            // that produced it so a pinned goal is explainable.
+            if let Some(terms) = search.goal_terms(*id) {
+                println!(
+                    "              distance={:.1} untried={:.1} success={:.1} failure={:.1} stable={:.1} score={:.1} tries={}",
+                    terms.distance,
+                    terms.untried,
+                    terms.success,
+                    terms.failure,
+                    terms.stable,
+                    terms.score_bonus,
+                    terms.tries
+                );
+            }
         }
     }
 
@@ -402,6 +421,14 @@ fn print_stats(search: &Search, checkpoint: Option<&PathBuf>) {
     println!("frontier_share={:.4}", share(metrics.frontier_games));
     println!("negative_priorities={}", metrics.negative_priorities);
     println!("never_targeted={}", metrics.never_targeted);
+    println!("score_tries_p50={}", metrics.score_tries_p50);
+    println!("score_tries_max={}", metrics.score_tries_max);
+    println!("score_bonus_p50={:.3}", metrics.score_bonus_p50);
+    println!("score_bonus_max={:.3}", metrics.score_bonus_max);
+    println!(
+        "goalsucc_stablecount_ratio={:.3}",
+        metrics.goalsucc_stablecount_ratio
+    );
     if let Some(path) = checkpoint {
         if let Ok(meta) = std::fs::metadata(path) {
             println!("checkpoint_bytes={}", meta.len());

@@ -54,6 +54,11 @@ const LONG_PATH_TURNS: isize = 12;
 /// limit. Without this a deep goal can be selected forever and never reached.
 const TURN_STRETCH_FRACTION: isize = 4;
 
+/// Ceiling on the score term in the goal priority. Without it `maxscore *
+/// scoremult` is two orders of magnitude larger than distance and run counts,
+/// so the handful of scored tokens permanently pin the queue.
+const SCORE_BONUS_CAP: f64 = 150.0;
+
 /// Monotonic run counters that can be summed across parallel workers. The
 /// state-derived parts of [`Metrics`] come from the merged token table instead.
 #[derive(Debug, Clone, Copy, Default)]
@@ -126,6 +131,45 @@ pub struct Metrics {
     pub negative_priorities: usize,
     pub never_targeted: usize,
     pub avg_path_len: f64,
+    /// Median / maximum goal attempts since the token's best score.
+    pub score_tries_p50: u64,
+    pub score_tries_max: u64,
+    /// Median / maximum score bonus currently in the priority.
+    pub score_bonus_p50: f64,
+    pub score_bonus_max: f64,
+    /// Sum of `goalsucc` over sum of `stablecount`. A value near the thread
+    /// count is the fingerprint of `stablecount` being max-merged instead of
+    /// summed across workers.
+    pub goalsucc_stablecount_ratio: f64,
+}
+
+/// One goal's priority broken into the terms that produced it. `value` is what
+/// the queue sorts on; the rest make a pinned or buried goal explainable.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GoalTerms {
+    pub distance: f64,
+    pub untried: f64,
+    pub success: f64,
+    pub failure: f64,
+    pub stable: f64,
+    pub score_bonus: f64,
+    /// Attempts used for the score decay (currently `goalruns`).
+    pub tries: u64,
+    pub value: f64,
+}
+
+fn median_u64(sorted: &[u64]) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    sorted[sorted.len() / 2]
+}
+
+fn median_f64(sorted: &[f64]) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    sorted[sorted.len() / 2]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +229,7 @@ pub struct Search {
     pub stablethresh: i64,
     pub prescoretok: Option<String>,
     pub scoremult: f64,
+    pub run_meta: crate::checkpoint::RunMeta,
     pub w_distance: f64,
     pub w_untried: f64,
     pub w_success: f64,
@@ -287,7 +332,8 @@ impl Search {
             prob_end: 0.5,
             stablethresh: 5,
             prescoretok: Some("Your score is".to_string()),
-            scoremult: 100.0,
+            scoremult: 15.0,
+            run_meta: crate::checkpoint::RunMeta::default(),
             w_distance: 1.0,
             w_untried: 4.0,
             w_success: 2.0,
@@ -414,6 +460,50 @@ impl Search {
         }
     }
 
+    /// The individual terms of a goal's priority, for `--top` / `--stats`
+    /// output. The total alone hid a ~4000-point score term that pinned the
+    /// queue to the same ten tokens.
+    pub fn goal_terms(&self, id: TokenId) -> Option<GoalTerms> {
+        let stat = self.stats.get(&id)?;
+        let stable = self.stabletoks.contains(&id);
+        Some(self.priority_terms(stat, stable))
+    }
+
+    fn priority_terms(&self, stat: &Stat, stable: bool) -> GoalTerms {
+        let fails = stat.goalruns.saturating_sub(stat.goalsucc);
+        let failure_rate = fails as f64 / (stat.goalruns as f64 + 1.0);
+        let distance = stat.first as f64 * self.w_distance;
+        let untried = (stat.goalruns as f64 + 1.0).ln() * self.w_untried;
+        let success = (stat.goalsucc as f64 + 1.0).ln() * self.w_success;
+        let failure = fails as f64 * failure_rate * self.w_fail;
+        let stable_term = if stable { self.w_stable } else { 0.0 };
+        let score_bonus = self.score_bonus(stat);
+        GoalTerms {
+            distance,
+            untried,
+            success,
+            failure,
+            stable: stable_term,
+            score_bonus,
+            // The decay uses `goalruns`, which is additive across workers (see
+            // `merge_delta`); `score_tries` cannot be merged reliably.
+            tries: stat.goalruns,
+            value: distance + untried - success + failure + stable_term - score_bonus,
+        }
+    }
+
+    fn score_bonus(&self, stat: &Stat) -> f64 {
+        if stat.maxscore <= 0 {
+            return 0.0;
+        }
+        // `score_tries` is min-merged in older checkpoints and is only kept as
+        // telemetry now. `goalruns` is monotone and additive, so one lucky
+        // scored run cannot pin a token forever even under `--threads > 1`.
+        (stat.maxscore as f64 * self.scoremult
+            / (1.0 + stat.goalruns as f64 / self.score_decay.max(1.0)))
+        .min(SCORE_BONUS_CAP)
+    }
+
     pub fn current_room(&self) -> &str {
         &self.room
     }
@@ -520,6 +610,10 @@ impl Search {
         let mut never_targeted = 0;
         let mut path_total = 0usize;
         let mut path_count = 0usize;
+        let mut tries: Vec<u64> = Vec::new();
+        let mut bonuses: Vec<f64> = Vec::new();
+        let mut succ_total = 0u64;
+        let mut stable_total = 0u64;
         for id in self.stat_ids() {
             let stat = self.stat(id);
             if stat
@@ -536,7 +630,17 @@ impl Search {
                 path_total += best.len();
                 path_count += 1;
             }
+            tries.push(stat.score_tries);
+            if stat.maxscore > 0 {
+                bonuses.push(self.score_bonus(stat));
+            }
+            if stat.stablecount > 0 && stat.goalsucc > 0 {
+                succ_total = succ_total.saturating_add(stat.goalsucc);
+                stable_total = stable_total.saturating_add(stat.stablecount as u64);
+            }
         }
+        tries.sort_unstable();
+        bonuses.sort_by(f64::total_cmp);
         Metrics {
             plays: self.numplays,
             turns: self.turns_played,
@@ -558,6 +662,15 @@ impl Search {
                 0.0
             } else {
                 path_total as f64 / path_count as f64
+            },
+            score_tries_p50: median_u64(&tries),
+            score_tries_max: tries.last().copied().unwrap_or(0),
+            score_bonus_p50: median_f64(&bonuses),
+            score_bonus_max: bonuses.last().copied().unwrap_or(0.0),
+            goalsucc_stablecount_ratio: if stable_total == 0 {
+                0.0
+            } else {
+                succ_total as f64 / stable_total as f64
             },
         }
     }
@@ -625,6 +738,53 @@ impl Search {
         for id in ids {
             self.updatetokfreq(id);
         }
+    }
+
+    /// Promote or demote goals from the merged `stablecount`. A worker only
+    /// checks its own local counter, so without this a goal that is one success
+    /// short in each of several workers would never cross its threshold in the
+    /// master even though the summed counter has.
+    pub fn refresh_stability(&mut self) {
+        let ids = self.stat_ids();
+        for id in ids {
+            let (first, stablecount) = match self.stats.get(&id) {
+                Some(stat) => (stat.first, stat.stablecount),
+                None => continue,
+            };
+            let thresh = self.stablethresh as f64 * (first as f64 + 1.0);
+            if stablecount as f64 >= thresh {
+                self.makestable(id);
+            } else if (stablecount as f64) < thresh / 2.0 {
+                self.makeunstable(id);
+            }
+        }
+    }
+
+    /// Repair the counters written by versions that max-merged `stablecount`
+    /// across workers. Every success adds one and every missed goal subtracts
+    /// two, so `3 * goalsucc - 2 * goalruns` reconstructs the counter closely
+    /// (replay-bundle credits make it approximate, never fatal). The stable set
+    /// is then derived from the repaired counts instead of trusting the
+    /// checkpoint's stale promotions.
+    pub fn repair_legacy_stability(&mut self) {
+        self.stabletoks.clear();
+        self.stableorder.clear();
+        let ids = self.stat_ids();
+        for id in ids {
+            let (runs, succ) = match self.stats.get(&id) {
+                Some(stat) => (stat.goalruns, stat.goalsucc),
+                None => continue,
+            };
+            let runs = i64::try_from(runs).unwrap_or(i64::MAX);
+            let succ = i64::try_from(succ).unwrap_or(i64::MAX);
+            let repaired = succ
+                .saturating_mul(3)
+                .saturating_sub(runs.saturating_mul(2));
+            if let Some(stat) = self.stats.get_mut(&id) {
+                stat.stablecount = repaired.max(0);
+            }
+        }
+        self.refresh_stability();
     }
 
     // ---------------------------------------------------------------- games
@@ -876,11 +1036,13 @@ impl Search {
         Some(pool[self.rng.below(pool.len())].2)
     }
 
-    /// Pick a deep token with a known route that has never been reproduced as
-    /// a goal. This is the complement of `exploration_goal`: exploration tries
-    /// things never attempted, the frontier retries the far edge of what is
-    /// already known. Without it, the linear `first` penalty in the priority
-    /// formula can keep a late-game goal out of the queue forever.
+    /// Pick a deep token with a known route that has not yet become stable.
+    /// This is the complement of `exploration_goal`: exploration tries things
+    /// never attempted, the frontier retries the far edge of what is already
+    /// known. Without it, the linear `first` penalty in the priority formula
+    /// can keep a late-game goal out of the queue forever. Tokens that have
+    /// succeeded once or twice but are still short of their stability
+    /// threshold belong here too: that is the attic/knife/rope layer.
     fn frontier_goal(&mut self, exclude: &[TokenId]) -> Option<TokenId> {
         let mut pool: Vec<(usize, u64, TokenId)> = self
             .stats
@@ -888,7 +1050,6 @@ impl Search {
             .filter(|(id, stat)| {
                 stat.first > 0
                     && stat.first < FIRST_UNKNOWN
-                    && stat.goalsucc == 0
                     && stat.best.as_ref().is_some_and(|b| !b.is_empty())
                     && !self.stabletoks.contains(id)
                     && !exclude.contains(id)
@@ -899,8 +1060,9 @@ impl Search {
         if pool.is_empty() {
             return None;
         }
-        // Deepest first; ties go to the least-attempted, then name for stable
-        // output across processes.
+        // Deepest first; ties go to the least-attempted (which favours the
+        // barely-reproduced over the already-scored cluster), then name for
+        // stable output across processes.
         pool.sort_by(|a, b| {
             b.0.cmp(&a.0)
                 .then_with(|| a.1.cmp(&b.1))
@@ -1269,30 +1431,21 @@ impl Search {
         }
 
         let stable = self.stabletoks.contains(&id);
+        // Compute the terms before taking the mutable borrow used to swap the
+        // queue entry.
+        let terms = match self.stats.get(&id) {
+            Some(stat) => self.priority_terms(stat, stable),
+            None => return,
+        };
 
         let (priority, old) = match self.stats.get_mut(&id) {
             Some(stat) => {
                 let old = stat.priority.take();
-                let fails = stat.goalruns.saturating_sub(stat.goalsucc);
-                let failure_rate = fails as f64 / (stat.goalruns as f64 + 1.0);
-                let failure_penalty = fails as f64 * failure_rate * self.w_fail;
-                let score_bonus = if stat.maxscore > 0 {
-                    stat.maxscore as f64 * self.scoremult
-                        / (1.0 + stat.score_tries as f64 / self.score_decay.max(1.0))
-                } else {
-                    0.0
-                };
-                let value = stat.first as f64 * self.w_distance
-                    + (stat.goalruns as f64 + 1.0).ln() * self.w_untried
-                    - (stat.goalsucc as f64 + 1.0).ln() * self.w_success
-                    + failure_penalty
-                    + if stable { self.w_stable } else { 0.0 }
-                    - score_bonus;
                 // Tokens from the very first turn are uninformative; leave them
                 // out of the queue entirely.
                 let priority = if stat.first > 0 {
                     Some(Score {
-                        value,
+                        value: terms.value,
                         token: id,
                         name: self.tokens.shared(id),
                     })

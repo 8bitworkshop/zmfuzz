@@ -26,6 +26,15 @@ impl TokenUI {
     pub fn drain_prints(&mut self) -> Vec<String> {
         std::mem::take(&mut self.prints)
     }
+
+    /// The last status bar the VM drew: `(room name, score or clock)` for v1-3.
+    /// The interpreter updates it on every `read`, so it is the cheapest way to
+    /// know where the search is without walking the object table.
+    pub fn status(&self) -> Option<(&str, &str)> {
+        self.status_line
+            .as_ref()
+            .map(|(left, right)| (left.as_str(), right.as_str()))
+    }
 }
 
 impl UI for TokenUI {

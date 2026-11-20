@@ -47,12 +47,16 @@ impl GameEnd {
 }
 
 /// One turn's worth of state, handed to the live display once per turn.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Progress {
     pub turn: isize,
     pub goal: String,
     pub cmd: String,
     pub tokens: Vec<String>,
+    /// Room name from the VM status bar, if the story draws one.
+    pub room: String,
+    /// The right half of the status bar: `score/moves`, or a clock.
+    pub score: String,
 }
 
 /// Events kept for the display: enough to fill a screen, bounded so a
@@ -83,8 +87,10 @@ pub struct Search {
     pub verbose: bool,
     pub log_instructions: bool,
     pub checkpoint_path: Option<PathBuf>,
-    /// Called once per turn, if a live display is attached.
-    pub progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
+    /// Called once per turn, if a live display is attached. It gets the search
+    /// itself as well, so a single-threaded driver can redraw (and poll keys)
+    /// without waiting for the game to end.
+    pub progress: Option<Arc<dyn Fn(&Search, Progress) + Send + Sync>>,
 
     // --- knowledge, persists across games ---
     pub rng: Rng,
@@ -116,6 +122,9 @@ pub struct Search {
     curscore: i64,
     hacks: Vec<TokenId>,
     playthru: Playthrough,
+    /// Last room name the VM's status bar reported, and its score half.
+    room: String,
+    score: String,
     /// `NEWTOKEN` / `STABLE` / `HACK` / ... lines awaiting the display.
     eventbuf: VecDeque<String>,
 }
@@ -171,6 +180,8 @@ impl Search {
             curscore: 0,
             hacks: Vec::new(),
             playthru: Playthrough::new(),
+            room: String::new(),
+            score: String::new(),
             eventbuf: VecDeque::new(),
         }
     }
@@ -233,6 +244,35 @@ impl Search {
             ),
             None => (0, 0, 0, false, 0),
         }
+    }
+
+    pub fn current_room(&self) -> &str {
+        &self.room
+    }
+
+    pub fn current_score(&self) -> &str {
+        &self.score
+    }
+
+    /// The commands of the game in progress (or the last one played), in order.
+    /// The synthetic SCORE turn is left out: it is not a command the search
+    /// chose and would render as a dangling arrow.
+    pub fn current_route(&self) -> Vec<String> {
+        self.playthru
+            .turns
+            .iter()
+            .filter(|turn| !turn.cmd.is_empty())
+            .map(|turn| turn.cmd.clone())
+            .collect()
+    }
+
+    /// Shortest known command path to `id`, or empty if none is recorded yet.
+    pub fn best_path(&self, id: TokenId) -> Vec<String> {
+        self.stats
+            .get(&id)
+            .and_then(|stat| stat.best.as_ref())
+            .map(|turns| turns.iter().map(|turn| turn.cmd.clone()).collect())
+            .unwrap_or_default()
     }
 
     pub fn token_name(&self, id: TokenId) -> &str {
@@ -417,6 +457,8 @@ impl Search {
         self.goalmet = false;
         self.hacks.clear();
         self.playthru = Playthrough::new();
+        self.room.clear();
+        self.score.clear();
 
         // Pick a goal from the ten most attractive tokens.
         let candidates: Vec<TokenId> = self.tokfreq.iter().take(10).map(|s| s.token).collect();
@@ -464,6 +506,12 @@ impl Search {
         for event in zm.drain_events() {
             self.apply_event(event);
         }
+        if let Some((room, score)) = zm.ui.status() {
+            self.room.clear();
+            self.room.push_str(room);
+            self.score.clear();
+            self.score.push_str(score);
+        }
         self.report_progress();
     }
 
@@ -483,12 +531,17 @@ impl Search {
             .iter()
             .map(|&id| self.tokens.name(id).to_string())
             .collect();
-        callback(Progress {
-            turn: self.numturns,
-            goal,
-            cmd: self.turncmd.clone().unwrap_or_default(),
-            tokens,
-        });
+        callback(
+            self,
+            Progress {
+                turn: self.numturns,
+                goal,
+                cmd: self.turncmd.clone().unwrap_or_default(),
+                tokens,
+                room: self.room.clone(),
+                score: self.score.clone(),
+            },
+        );
     }
 
     fn apply_event(&mut self, event: VmEvent) {
@@ -1010,7 +1063,18 @@ impl Search {
 
     /// The command sent most recently.
     pub fn current_cmd(&self) -> String {
-        self.turncmd.clone().unwrap_or_default()
+        self.turncmd.clone().unwrap_or_else(|| {
+            // Between games `turncmd` is empty, and the last recorded turn is
+            // the synthetic SCORE one (also empty); the display wants the last
+            // command that actually went to the story.
+            self.playthru
+                .turns
+                .iter()
+                .rev()
+                .find(|turn| !turn.cmd.is_empty())
+                .map(|turn| turn.cmd.clone())
+                .unwrap_or_default()
+        })
     }
 }
 

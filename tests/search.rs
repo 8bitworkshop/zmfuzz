@@ -181,7 +181,7 @@ fn fuzzes_a_v3_game() {
 #[test]
 fn parallel_workers_merge_into_the_master() {
     use zmfuzz::parallel;
-    use zmfuzz::tui::{Tui, TuiConfig};
+    use zmfuzz::tui::{Screen, Tui, TuiConfig};
 
     let ui = Tui::new(
         false,
@@ -192,6 +192,7 @@ fn parallel_workers_merge_into_the_master() {
             seed: 21,
             target: 4,
             checkpoint: String::new(),
+            screen: Screen::Now,
         },
     );
     let master = Search::new(story("minizork.z3"), 21, 30, false);

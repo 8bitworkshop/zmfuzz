@@ -46,6 +46,7 @@ zmfuzz <story.z3> [options]
   --no-events    ignore VM side effects (text tokens only)
   --ui           live full-screen display (default: on when stdout is a TTY)
   --no-ui        plain per-run output even on a terminal
+  --screen S     start on pane S: now tree map tokens workers log (or 1-6)
   --log          trace every VM instruction on stderr (very noisy)
   -v, --verbose  print NEWTOKEN / REDUCE / STABLE / SCORE / HACK / DIVERGE
 ```
@@ -124,15 +125,33 @@ they exchange only plain checkpoints.
 
 ## Live display
 
-On a terminal, `zmfuzz` takes over the screen for a live view: a block per
-worker (games, tokens, stable goals, current turn/goal/command), the master's
-token knowledge, the cheapest goals, and a color-coded event log. It uses the
-alternate screen and raw input via `crossterm`; the terminal is restored on exit,
-`q`, `Esc`, or Ctrl-C. `--no-ui` keeps the old per-run lines, and `--ui` forces
-it on even when stdout is redirected (useful for capturing frames). The event
-pane shows `NEWTOKEN` / `REDUCE` / `STABLE` / `SCORE` / `HACK` as they happen;
-`-v` only affects the plain per-run output. `--log` instruction traces go to
-stderr and are not useful with the display.
+On a terminal, `zmfuzz` takes over the screen for a live view. A pinned header
+keeps the answers that must never scroll away — games played and rate, tokens,
+vocab, stable count, top score, goal queue size — above a tab strip and one
+switchable pane. The pane is what you flip between:
+
+| pane | shows |
+| --- | --- |
+| `now` | the featured worker: turn bar, room, score, goal, current command, the route this game has taken, and the newest events |
+| `tree` | the command trie: the cheapest goals' best known paths merged by shared prefix (`★` stable, `●` on this game's route) |
+| `map` | room graph and object contents (placeholder until rooms are collected) |
+| `tokens` | the goal queue with runs/succ/first/count, then stable tokens in promotion order |
+| `workers` | one row per worker, including room and score |
+| `log` | the event stream, repeats collapsed into `×N` |
+
+Keys: `1`-`6` select a pane, `Tab`/`Shift-Tab` cycle, `↑`/`↓`/`PgUp`/`PgDn`/
+`Home`/`End` scroll it (each pane remembers its offset), `w` cycles the featured
+worker, `?` toggles the help overlay, `q`/`Esc`/Ctrl-C stop the search. Room and
+score come from the VM status bar, which the interpreter redraws on every `read`,
+so they cost nothing extra.
+
+It uses the alternate screen and raw input via `crossterm`; the terminal is
+restored on exit. `--no-ui` keeps the plain per-run lines, and `--ui` forces the
+display on even when stdout is redirected (useful for capturing frames).
+`--screen S` picks the starting pane; with `--no-ui` the same flag prints one
+plain-text frame at the end instead, which is handy in logs and CI. `-v` only
+affects the plain per-run output. `--log` instruction traces go to stderr and
+are not useful with the display.
 
 ## Checkpoints
 

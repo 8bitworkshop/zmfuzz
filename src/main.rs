@@ -6,7 +6,7 @@ use std::process;
 
 use zmfuzz::parallel;
 use zmfuzz::search::Search;
-use zmfuzz::tui::{Tui, TuiConfig};
+use zmfuzz::tui::{Screen, Tui, TuiConfig};
 
 struct Args {
     story: PathBuf,
@@ -25,6 +25,7 @@ struct Args {
     resume: bool,
     fresh: bool,
     replay: Option<PathBuf>,
+    screen: Option<String>,
 }
 
 fn usage() -> ! {
@@ -52,6 +53,8 @@ OPTIONS:
     --log          trace every VM instruction on stderr (very noisy)
     --ui           live full-screen display (default: on when stdout is a TTY)
     --no-ui        plain per-run output even on a terminal
+    --screen S     start on pane S: now tree map tokens workers log
+                   (default now; 1-6/Tab switch panes while running)
     -v, --verbose  print NEWTOKEN/REDUCE/STABLE/goal events
     -h, --help     this text"
     );
@@ -76,6 +79,7 @@ fn parse_args() -> Args {
         resume: false,
         fresh: false,
         replay: None,
+        screen: None,
     };
     let mut story: Option<PathBuf> = None;
 
@@ -100,6 +104,7 @@ fn parse_args() -> Args {
             "--resume" => args.resume = true,
             "--fresh" | "--no-resume" => args.fresh = true,
             "--replay" => args.replay = Some(PathBuf::from(next_value(&mut it, "--replay"))),
+            "--screen" => args.screen = Some(next_value(&mut it, "--screen")),
             "--log" => args.log = true,
             "--no-events" => args.events = false,
             "--ui" => args.ui = Some(true),
@@ -158,6 +163,17 @@ fn main() {
     let ui_enabled = args
         .ui
         .unwrap_or_else(|| args.replay.is_none() && !args.log && std::io::stdout().is_terminal());
+
+    let screen = match &args.screen {
+        Some(name) => match Screen::parse(name) {
+            Some(screen) => screen,
+            None => {
+                eprintln!("zmfuzz: unknown screen {}", name);
+                usage();
+            }
+        },
+        None => Screen::Now,
+    };
 
     let worker_story = story.clone();
     let mut search = Search::new(story, args.seed, args.turns, args.verbose && !ui_enabled);
@@ -244,6 +260,7 @@ fn main() {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
+            screen,
         },
     );
 
@@ -271,6 +288,16 @@ fn main() {
     // The display owns the alternate screen; hand the terminal back before the
     // final, scrollback-friendly report.
     ui.finish();
+
+    // Without a terminal, `--screen X` still gets you the pane: one static
+    // frame, wide enough for the tab strip, printed once at the end.
+    if !ui_enabled {
+        if args.screen.is_some() {
+            for line in ui.frame_text(&search, 100, 40) {
+                println!("{}", line.trim_end());
+            }
+        }
+    }
 
     // What the search would aim at next, cheapest first.
     let queue = search.goal_queue();
@@ -301,7 +328,9 @@ fn main() {
 
 fn run_sequential(mut search: Search, runs: u64, ui: &Tui) -> Search {
     ui.set_workers(1);
-    search.progress = ui.progress_callback(0);
+    // The live variant redraws (and polls keys) every turn; the plain callback
+    // would leave the display frozen for the whole playthrough.
+    search.progress = ui.live_callback(0);
 
     let mut done = 0u64;
     loop {
@@ -313,9 +342,11 @@ fn run_sequential(mut search: Search, runs: u64, ui: &Tui) -> Search {
         done += 1;
 
         let events = search.take_events();
+        // Kept up to date even without a terminal: the panes are how a
+        // `--screen X --no-ui` run reports what it learned.
+        ui.push_events(events);
+        ui.game_done(0, &search, end);
         if ui.enabled() {
-            ui.push_events(events);
-            ui.game_done(0, &search, end);
             ui.render(&search);
         } else {
             println!(

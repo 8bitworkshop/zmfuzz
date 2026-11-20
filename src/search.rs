@@ -180,6 +180,13 @@ impl Search {
         self.numturns.max(0)
     }
 
+    /// Restart the random stream. Used when resuming: the run continues from
+    /// `base_seed + numplays`, so each invocation explores new ground instead
+    /// of replaying the sequence the checkpoint already recorded.
+    pub fn reseed(&mut self, seed: u64) {
+        self.rng = Rng::new(seed);
+    }
+
     pub fn version(&self) -> u8 {
         *self.story.first().unwrap_or(&0)
     }

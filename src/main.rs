@@ -23,6 +23,7 @@ struct Args {
     ui: Option<bool>,
     checkpoint: Option<PathBuf>,
     resume: bool,
+    fresh: bool,
     replay: Option<PathBuf>,
 }
 
@@ -37,13 +38,15 @@ USAGE:
 OPTIONS:
     --runs N       number of games to play (0 = forever, default 1)
     --turns N      turns per game (default 200)
-    --seed N       RNG seed (default 1; same seed = same search)
+    --seed N       RNG seed (default 1; same seed = same search). A resumed
+                 run starts at base+plays, so each invocation gets new ground
     --top N        how many frequent tokens to list (default 20)
     --threads N    worker threads (default 1)
     --batch N      games per worker before reporting (default 10)
     --sync N       re-share merged knowledge every N games (0 = at end only)
     --checkpoint F read/write search state at F (default ./<story>.save)
-    --resume       start from the checkpoint instead of a blank search
+    --resume       force loading the checkpoint (the default when it exists)
+    --fresh        ignore an existing checkpoint and start blank
     --replay F     feed commands from F, print the tokens each turn produced
     --no-events    ignore VM side effects (text tokens only)
     --log          trace every VM instruction on stderr (very noisy)
@@ -71,6 +74,7 @@ fn parse_args() -> Args {
         ui: None,
         checkpoint: None,
         resume: false,
+        fresh: false,
         replay: None,
     };
     let mut story: Option<PathBuf> = None;
@@ -94,6 +98,7 @@ fn parse_args() -> Args {
                 args.checkpoint = Some(PathBuf::from(next_value(&mut it, "--checkpoint")))
             }
             "--resume" => args.resume = true,
+            "--fresh" | "--no-resume" => args.fresh = true,
             "--replay" => args.replay = Some(PathBuf::from(next_value(&mut it, "--replay"))),
             "--log" => args.log = true,
             "--no-events" => args.events = false,
@@ -177,18 +182,33 @@ fn main() {
         return;
     }
 
-    if args.resume {
-        if let Some(path) = &args.checkpoint {
+    // Resuming is the default: a checkpoint on disk is accumulated knowledge,
+    // and the run would overwrite it on exit anyway. `--fresh` opts out, and an
+    // explicit `--resume` still reports a missing file as an error.
+    let mut seed = args.seed;
+    if let Some(path) = &args.checkpoint {
+        let exists = path.exists();
+        if args.resume || (exists && !args.fresh) {
             match search.load_checkpoint(path) {
-                Ok(()) => println!(
-                    "resumed from {}: {} plays, {} tokens, {} stable",
-                    path.display(),
-                    search.numplays,
-                    search.token_count(),
-                    search.stable_count()
-                ),
+                Ok(()) => {
+                    // Advance the stream by the work already done, so a resumed
+                    // run explores new games instead of replaying the old ones.
+                    seed = args.seed.wrapping_add(search.numplays);
+                    search.reseed(seed);
+                    println!(
+                        "resumed from {}: {} plays, {} tokens, {} stable (seed {} -> {})",
+                        path.display(),
+                        search.numplays,
+                        search.token_count(),
+                        search.stable_count(),
+                        args.seed,
+                        seed
+                    );
+                }
                 Err(e) => eprintln!("zmfuzz: cannot resume from {}: {}", path.display(), e),
             }
+        } else if exists && args.fresh {
+            println!("starting fresh; {} will be overwritten", path.display());
         }
     }
 
@@ -201,7 +221,7 @@ fn main() {
             args.runs.to_string()
         },
         args.turns,
-        args.seed,
+        seed,
         args.threads,
         if args.threads == 1 { "" } else { "s" }
     );
@@ -217,7 +237,7 @@ fn main() {
             title,
             threads: args.threads,
             turns: args.turns,
-            seed: args.seed,
+            seed,
             target: args.runs,
             checkpoint: args
                 .checkpoint
@@ -236,7 +256,7 @@ fn main() {
             parallel::Options {
                 story: worker_story,
                 threads: args.threads,
-                seed: args.seed,
+                seed,
                 turns: args.turns,
                 events: args.events,
                 verbose,

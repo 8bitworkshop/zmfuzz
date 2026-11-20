@@ -88,6 +88,39 @@ fn checkpoint_round_trip_preserves_knowledge() {
 }
 
 #[test]
+fn resume_shifts_the_stream_past_recorded_plays() {
+    let base_seed = 3;
+    let mut base = Search::new(story("minizork.z3"), base_seed, 40, false);
+    base.play_game();
+    let checkpoint = base.to_checkpoint();
+
+    // Without a reseed the continuation replays the sequence the checkpoint
+    // already covered; that is the behaviour resuming has to avoid.
+    let mut straight = Search::new(story("minizork.z3"), base_seed, 40, false);
+    straight.load(checkpoint.clone());
+    straight.play_game();
+
+    let shifted = base_seed.wrapping_add(checkpoint.numplays);
+    let mut resumed = Search::new(story("minizork.z3"), base_seed, 40, false);
+    resumed.load(checkpoint.clone());
+    resumed.reseed(shifted);
+    resumed.play_game();
+
+    // Reseeding is equivalent to having started at the shifted seed with the
+    // same accumulated knowledge.
+    let mut fresh = Search::new(story("minizork.z3"), shifted, 40, false);
+    fresh.load(checkpoint);
+    fresh.play_game();
+    assert_eq!(token_names(&resumed), token_names(&fresh));
+
+    assert_ne!(
+        token_names(&straight),
+        token_names(&resumed),
+        "resumed run replayed the checkpoint's games"
+    );
+}
+
+#[test]
 fn conformance_battery_never_asks_for_input() {
     // czech.z5 runs its tests and ends with "quit!", so there is nothing to fuzz.
     let mut search = Search::new(story("czech.z5"), 1, 50, false);

@@ -29,14 +29,6 @@ goals (cheapest first):
        3.386  @mv_112_22                           first=2 runs=1 succ=1 stable=false score=0
 ```
 
-## Why a sibling crate
-
-`zmfuzz` is deliberately *not* a member of the `folly` workspace. Building
-anything from `folly`'s root resolves `armrest` -> `tflite` -> the `tensorflow`
-git submodule, which is slow and unnecessary here. The empty `[workspace]` table
-makes this its own root; the only *path* dependency is `encrusted-heart`
-(`crossterm` and `serde` come from crates.io).
-
 ## Usage
 
 ```
@@ -50,7 +42,7 @@ zmfuzz <story.z3> [options]
   --batch N      games per worker before reporting/merging (default 10)
   --sync N       re-share merged knowledge every N games (0 = end only, default 1000)
   --checkpoint F read/write search state at F (default ./<story>.save)
-  --resume       start from the checkpoint instead of a blank search
+  --fresh        ignore an existing checkpoint and start a blank search
   --no-events    ignore VM side effects (text tokens only)
   --ui           live full-screen display (default: on when stdout is a TTY)
   --no-ui        plain per-run output even on a terminal
@@ -145,8 +137,14 @@ stderr and are not useful with the display.
 ## Checkpoints
 
 `--checkpoint` writes `{numplays, stabletoks, stats[]}` as JSON, with best paths
-included, on exit and every 10,000 games. `--resume` reads it back, re-interns
-tokens, and rebuilds the goal queue. Unlike the JS version (which uses `flatted`
+included, on exit and every 10,000 games. If the file exists it is loaded back
+at startup — tokens are re-interned and the goal queue rebuilt — so knowledge
+accumulates across invocations without retyping `--resume`. The random stream
+is reseeded at `seed + numplays`, so each invocation explores new games instead
+of replaying the ones the checkpoint already recorded; a given checkpoint plus
+`--seed` still reproduces a run exactly. `--fresh` ignores
+an existing file and starts blank (it will still be overwritten on exit).
+Unlike the JS version (which uses `flatted`
 because JS object graphs are cyclic), best paths are stored as plain nested
 arrays, so the file is readable and diffable.
 
@@ -196,3 +194,12 @@ tools/compare.sh minizork.z3 15     # side-by-side with search.js (needs node + 
 # License
 MIT; see `LICENSE`. `encrusted-heart` is linked as a path dependency and is
 itself MIT (Sterling DeMille, Ben Kirwin) — see `../folly/encrusted-heart/LICENSE`.
+
+## Why a sibling crate
+
+`zmfuzz` is deliberately *not* a member of the `folly` workspace. Building
+anything from `folly`'s root resolves `armrest` -> `tflite` -> the `tensorflow`
+git submodule, which is slow and unnecessary here. The empty `[workspace]` table
+makes this its own root; the only *path* dependency is `encrusted-heart`
+(`crossterm` and `serde` come from crates.io).
+

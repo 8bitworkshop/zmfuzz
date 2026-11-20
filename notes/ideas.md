@@ -1,8 +1,10 @@
 # zmfuzz — ideas for next steps
 
-Companion to `NEXT-STEPS.md` (which still has the older handoff/parity notes).
-This file is the search-efficiency roadmap: what is done, what is left, and how
-I would sequence it.
+Companion to `next-steps.md` (which still has the older handoff/parity notes).
+This file is the search-efficiency idea inventory: what is done, what is left.
+Sequencing, dependencies and kill criteria now live in [`roadmap.md`](roadmap.md);
+read that first. The one idea that has a full design doc is
+[`near-miss.md`](near-miss.md) (roadmap stage 0).
 
 ## Where things stand
 

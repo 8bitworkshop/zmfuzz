@@ -1,0 +1,28 @@
+== stats ==
+plays=400
+turns=80000
+tokens=347
+stable=22
+newtokens_per_1k_turns=4.338
+stable_per_1k_games=55.000
+useful_command_rate=0.2492
+refusal_rate=0.7508
+state_changing_command_rate=0.2481
+state_changes_per_turn=0.8238
+replay_divergence_rate=0.0120
+avg_path_len=46.53
+goal_games=399
+top10_share=0.7519
+explore_share=0.1955
+frontier_share=0.0526
+negative_priorities=0
+never_targeted=166
+score_tries_p50=1
+score_tries_max=13
+score_bonus_p50=0.000
+score_bonus_max=0.000
+goalsucc_stablecount_ratio=1.110
+checkpoint_bytes=1076738
+elapsed_s=4
+story=minizork.z3
+games=400 turns=200 seed=1

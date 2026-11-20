@@ -403,6 +403,10 @@ fn print_stats(search: &Search, checkpoint: Option<&PathBuf>) {
         rate(metrics.useful_turns, metrics.turns)
     );
     println!(
+        "refusal_rate={:.4}",
+        rate(metrics.refusal_turns, metrics.turns)
+    );
+    println!(
         "state_changing_command_rate={:.4}",
         rate(metrics.state_turns, metrics.turns)
     );

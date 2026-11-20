@@ -45,6 +45,14 @@ const MAX_REPLAY_CREDITS: usize = 8;
 /// keep the model from collapsing onto one shape.
 const TEMPLATE_POOL: usize = 256;
 
+/// Ceiling on the pool of near-miss commands mined from refused turns.
+const REFUSAL_POOL: usize = 128;
+
+/// Share of template draws that come from refused commands rather than commands
+/// that actually changed something. A near-miss is real evidence (the parser
+/// accepted it) but weaker than a turn that worked.
+const REFUSAL_WEIGHT: f64 = 0.35;
+
 /// A best path at least this long is replayed as a sequence. Retrying only the
 /// command that produced the token works when the goal is a turn or two away;
 /// for a far-away goal it throws away the whole route that got there.
@@ -65,6 +73,7 @@ const SCORE_BONUS_CAP: f64 = 150.0;
 pub struct RunCounters {
     pub turns: u64,
     pub useful_turns: u64,
+    pub refusal_turns: u64,
     pub state_turns: u64,
     pub newtokens: u64,
     pub state_changes: u64,
@@ -82,6 +91,7 @@ impl RunCounters {
         RunCounters {
             turns: self.turns.saturating_sub(earlier.turns),
             useful_turns: self.useful_turns.saturating_sub(earlier.useful_turns),
+            refusal_turns: self.refusal_turns.saturating_sub(earlier.refusal_turns),
             state_turns: self.state_turns.saturating_sub(earlier.state_turns),
             newtokens: self.newtokens.saturating_sub(earlier.newtokens),
             state_changes: self.state_changes.saturating_sub(earlier.state_changes),
@@ -97,6 +107,7 @@ impl RunCounters {
     pub fn add(&mut self, other: &RunCounters) {
         self.turns = self.turns.saturating_add(other.turns);
         self.useful_turns = self.useful_turns.saturating_add(other.useful_turns);
+        self.refusal_turns = self.refusal_turns.saturating_add(other.refusal_turns);
         self.state_turns = self.state_turns.saturating_add(other.state_turns);
         self.newtokens = self.newtokens.saturating_add(other.newtokens);
         self.state_changes = self.state_changes.saturating_add(other.state_changes);
@@ -120,6 +131,9 @@ pub struct Metrics {
     pub stable: usize,
     pub newtokens: u64,
     pub useful_turns: u64,
+    /// Turns whose command the parser accepted but the game refused. These are
+    /// near-misses: grammar-valid command shapes with an unmet precondition.
+    pub refusal_turns: u64,
     pub state_turns: u64,
     pub state_changes: u64,
     pub replay_turns: u64,
@@ -310,11 +324,15 @@ pub struct Search {
     top10_games: u64,
     explore_games: u64,
     frontier_games: u64,
+    refusal_turns: u64,
     replay_credits: usize,
 
     // --- command templates mined from commands that produced a token ---
     cmdtemplates: Vec<Vec<String>>,
     cmdtemplateset: HashSet<String>,
+    // --- near-miss commands: understood by the parser, refused by the game ---
+    refusals: Vec<Vec<String>>,
+    refusalset: HashSet<String>,
 }
 
 impl Search {
@@ -394,9 +412,12 @@ impl Search {
             top10_games: 0,
             explore_games: 0,
             frontier_games: 0,
+            refusal_turns: 0,
             replay_credits: 0,
             cmdtemplates: Vec::new(),
             cmdtemplateset: HashSet::new(),
+            refusals: Vec::new(),
+            refusalset: HashSet::new(),
         }
     }
 
@@ -648,6 +669,7 @@ impl Search {
             stable: self.stable_count(),
             newtokens: self.newtoken_count,
             useful_turns: self.useful_turns,
+            refusal_turns: self.refusal_turns,
             state_turns: self.state_turns,
             state_changes: self.state_changes,
             replay_turns: self.replay_turns,
@@ -680,6 +702,7 @@ impl Search {
         RunCounters {
             turns: self.turns_played,
             useful_turns: self.useful_turns,
+            refusal_turns: self.refusal_turns,
             state_turns: self.state_turns,
             newtokens: self.newtoken_count,
             state_changes: self.state_changes,
@@ -696,6 +719,7 @@ impl Search {
     pub fn add_run_counters(&mut self, counters: &RunCounters) {
         self.turns_played = self.turns_played.saturating_add(counters.turns);
         self.useful_turns = self.useful_turns.saturating_add(counters.useful_turns);
+        self.refusal_turns = self.refusal_turns.saturating_add(counters.refusal_turns);
         self.state_turns = self.state_turns.saturating_add(counters.state_turns);
         self.newtoken_count = self.newtoken_count.saturating_add(counters.newtokens);
         self.state_changes = self.state_changes.saturating_add(counters.state_changes);
@@ -723,6 +747,10 @@ impl Search {
 
     pub fn set_stats(&mut self, stats: HashMap<TokenId, Stat>) {
         self.stats = stats;
+        // The queue holds `Score` entries for tokens that may no longer be in
+        // the table. Callers reindex, which only refreshes ids that exist, so
+        // a stale entry would otherwise outrank anything just installed.
+        self.tokfreq.clear();
     }
 
     pub fn restore_stable(&mut self, id: TokenId) {
@@ -1530,6 +1558,14 @@ impl Search {
                 if let Some(cmd) = self.turncmd.clone() {
                     self.record_template(&cmd);
                 }
+            } else if self.command_is_understood() {
+                // Understood by the parser, refused by the game: no state
+                // change and no new text, but every word was recognised. That
+                // is a near-miss — see notes/near-miss.md.
+                self.refusal_turns += 1;
+                if let Some(cmd) = self.turncmd.clone() {
+                    self.record_refusal(&cmd);
+                }
             }
 
             for tok in self.turntoks.clone() {
@@ -1604,6 +1640,68 @@ impl Search {
         }
     }
 
+    /// True when every word of the turn's command is in the story dictionary.
+    ///
+    /// The game's own verb table is a second parser we cannot see, so this is a
+    /// conservative test: it proves the words are *known*, not that the command
+    /// made sense. The startup probe in `notes/near-miss.md` refines it.
+    fn command_is_understood(&self) -> bool {
+        let cmd = match &self.turncmd {
+            Some(cmd) => cmd,
+            None => return false,
+        };
+        if self.vocab.is_none() || IGNORED_WORDS.contains(&cmd.as_str()) {
+            return false;
+        }
+        let mut any = false;
+        for word in cmd.split_whitespace() {
+            any = true;
+            match self.tokens.get(word) {
+                Some(id) if self.vocabdict.contains(&id) => {}
+                _ => return false,
+            }
+        }
+        any
+    }
+
+    /// Remember a command the parser accepted but the game refused. Kept apart
+    /// from `cmdtemplates` so a near-miss cannot outvote a command that worked,
+    /// but sampled by the same mutation machinery in `template_cmd`.
+    fn record_refusal(&mut self, cmd: &str) {
+        let words: Vec<String> = cmd.split_whitespace().map(|w| w.to_string()).collect();
+        if words.is_empty() || words.len() > 4 {
+            return;
+        }
+        let key = words.join(" ");
+        if self.cmdtemplateset.contains(&key) {
+            return;
+        }
+        if self.refusalset.insert(key) {
+            if self.refusals.len() >= REFUSAL_POOL {
+                let index = self.rng.below(self.refusals.len());
+                let old = self.refusals.swap_remove(index);
+                self.refusalset.remove(&old.join(" "));
+            }
+            self.refusals.push(words);
+        }
+    }
+
+    /// Draw a template from either pool. Refusals get a fixed share of the
+    /// draws, and none at all until one exists, so early games are unchanged.
+    fn sample_template(&mut self) -> Option<Vec<String>> {
+        let templates = !self.cmdtemplates.is_empty();
+        let refusals = !self.refusals.is_empty();
+        if refusals && (!templates || self.rng.chance(REFUSAL_WEIGHT)) {
+            let index = self.rng.below(self.refusals.len());
+            return Some(self.refusals[index].clone());
+        }
+        if templates {
+            let index = self.rng.below(self.cmdtemplates.len());
+            return Some(self.cmdtemplates[index].clone());
+        }
+        None
+    }
+
     // ------------------------------------------------------------- commands
 
     fn makevocab(&mut self, zm: &Zmachine<TokenUI>) {
@@ -1628,7 +1726,9 @@ impl Search {
     fn getrandomcmd(&mut self) -> String {
         // Mined commands first: they tend to be grammatical, which is the
         // difference between a parser error and an actual state change.
-        if !self.cmdtemplates.is_empty() && self.rng.chance(self.prob_template) {
+        if (!self.cmdtemplates.is_empty() || !self.refusals.is_empty())
+            && self.rng.chance(self.prob_template)
+        {
             if let Some(cmd) = self.template_cmd() {
                 return cmd;
             }
@@ -1678,11 +1778,7 @@ impl Search {
     /// of a contextual command model: no grammar, just the shapes the story has
     /// already accepted.
     fn template_cmd(&mut self) -> Option<String> {
-        if self.cmdtemplates.is_empty() {
-            return None;
-        }
-        let index = self.rng.below(self.cmdtemplates.len());
-        let mut words = self.cmdtemplates[index].clone();
+        let mut words = self.sample_template()?;
 
         if self.rng.chance(0.75) && !words.is_empty() {
             let slot = self.rng.below(words.len());

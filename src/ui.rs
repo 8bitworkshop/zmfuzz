@@ -26,7 +26,6 @@ impl TokenUI {
     pub fn drain_prints(&mut self) -> Vec<String> {
         std::mem::take(&mut self.prints)
     }
-
 }
 
 impl UI for TokenUI {
@@ -52,4 +51,3 @@ impl UI for TokenUI {
     fn erase_window(&mut self, _window: Window) {}
     fn set_cursor(&mut self, _line: u16, _column: u16) {}
 }
-

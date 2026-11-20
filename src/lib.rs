@@ -7,8 +7,10 @@
 //! VM-state changes recorded by the VM.
 
 pub mod checkpoint;
+pub mod parallel;
 pub mod rng;
 pub mod search;
 pub mod stat;
 pub mod token;
+pub mod tui;
 pub mod ui;

@@ -5,8 +5,9 @@
 //! The heuristics are deliberately the JS ones, constants included, so traces
 //! from the two implementations can be compared.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use encrusted_heart::options::Options;
 use encrusted_heart::traits::VmEvent;
@@ -35,6 +36,29 @@ pub enum GameEnd {
     Stuck,
 }
 
+impl GameEnd {
+    pub fn label(self) -> &'static str {
+        match self {
+            GameEnd::Quit => "ended",
+            GameEnd::Turns => "turn-limit",
+            GameEnd::Stuck => "stuck",
+        }
+    }
+}
+
+/// One turn's worth of state, handed to the live display once per turn.
+#[derive(Debug, Clone)]
+pub struct Progress {
+    pub turn: isize,
+    pub goal: String,
+    pub cmd: String,
+    pub tokens: Vec<String>,
+}
+
+/// Events kept for the display: enough to fill a screen, bounded so a
+/// never-drained search cannot grow without limit.
+const EVENT_BUFFER: usize = 512;
+
 pub struct Search {
     story: Vec<u8>,
 
@@ -59,6 +83,8 @@ pub struct Search {
     pub verbose: bool,
     pub log_instructions: bool,
     pub checkpoint_path: Option<PathBuf>,
+    /// Called once per turn, if a live display is attached.
+    pub progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
 
     // --- knowledge, persists across games ---
     pub rng: Rng,
@@ -90,6 +116,8 @@ pub struct Search {
     curscore: i64,
     hacks: Vec<TokenId>,
     playthru: Playthrough,
+    /// `NEWTOKEN` / `STABLE` / `HACK` / ... lines awaiting the display.
+    eventbuf: VecDeque<String>,
 }
 
 impl Search {
@@ -114,6 +142,7 @@ impl Search {
             verbose,
             log_instructions: false,
             checkpoint_path: None,
+            progress: None,
 
             rng: Rng::new(seed),
             tokens: Interner::new(),
@@ -142,6 +171,7 @@ impl Search {
             curscore: 0,
             hacks: Vec::new(),
             playthru: Playthrough::new(),
+            eventbuf: VecDeque::new(),
         }
     }
 
@@ -418,6 +448,31 @@ impl Search {
         for event in zm.drain_events() {
             self.apply_event(event);
         }
+        self.report_progress();
+    }
+
+    /// Hand this turn to the live display, if one is attached. Token names are
+    /// only materialized when someone is watching.
+    fn report_progress(&self) {
+        let callback = match &self.progress {
+            Some(callback) => Arc::clone(callback),
+            None => return,
+        };
+        let goal = self
+            .goaltok
+            .map(|id| self.tokens.name(id).to_string())
+            .unwrap_or_default();
+        let tokens = self
+            .turntoks
+            .iter()
+            .map(|&id| self.tokens.name(id).to_string())
+            .collect();
+        callback(Progress {
+            turn: self.numturns,
+            goal,
+            cmd: self.turncmd.clone().unwrap_or_default(),
+            tokens,
+        });
     }
 
     fn apply_event(&mut self, event: VmEvent) {
@@ -456,7 +511,10 @@ impl Search {
         if self.usewords {
             let len = x.chars().count();
             let numeric = int_prefix(x).is_some();
-            let is_vocab = self.tokens.get(x).is_some_and(|id| self.vocabdict.contains(&id));
+            let is_vocab = self
+                .tokens
+                .get(x)
+                .is_some_and(|id| self.vocabdict.contains(&id));
 
             if len >= 3 && !is_vocab && !numeric {
                 let tok: String = x
@@ -912,10 +970,31 @@ impl Search {
         }
     }
 
-    fn info(&self, message: String) {
+    fn info(&mut self, message: String) {
         if self.verbose {
             println!("{}", message);
         }
+        if self.eventbuf.len() >= EVENT_BUFFER {
+            self.eventbuf.pop_front();
+        }
+        self.eventbuf.push_back(message);
+    }
+
+    /// Events emitted since the last call, for a display or a batch report.
+    pub fn take_events(&mut self) -> Vec<String> {
+        self.eventbuf.drain(..).collect()
+    }
+
+    /// The goal this game is currently aiming at.
+    pub fn current_goal(&self) -> String {
+        self.goaltok
+            .map(|id| self.tokens.name(id).to_string())
+            .unwrap_or_default()
+    }
+
+    /// The command sent most recently.
+    pub fn current_cmd(&self) -> String {
+        self.turncmd.clone().unwrap_or_default()
     }
 }
 

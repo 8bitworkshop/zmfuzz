@@ -28,7 +28,8 @@ goals (cheapest first):
 `zmfuzz` is deliberately *not* a member of the `folly` workspace. Building
 anything from `folly`'s root resolves `armrest` -> `tflite` -> the `tensorflow`
 git submodule, which is slow and unnecessary here. The empty `[workspace]` table
-makes this its own root; the only dependency is a path into `encrusted-heart`.
+makes this its own root; the only *path* dependency is `encrusted-heart`
+(`crossterm` and `serde` come from crates.io).
 
 ## Usage
 
@@ -39,9 +40,14 @@ zmfuzz <story.z3> [options]
   --turns N      turns per game (default 200, as in search.js)
   --seed N       RNG seed (default 1; same seed, same search)
   --top N        how many goal candidates to list (default 20)
+  --threads N    worker threads (default 1)
+  --batch N      games per worker before reporting/merging (default 10)
+  --sync N       re-share merged knowledge every N games (0 = end only, default 1000)
   --checkpoint F read/write search state at F (default ./<story>.save)
   --resume       start from the checkpoint instead of a blank search
   --no-events    ignore VM side effects (text tokens only)
+  --ui           live full-screen display (default: on when stdout is a TTY)
+  --no-ui        plain per-run output even on a terminal
   --log          trace every VM instruction on stderr (very noisy)
   -v, --verbose  print NEWTOKEN / REDUCE / STABLE / SCORE / HACK / DIVERGE
 ```
@@ -98,6 +104,38 @@ normally go (one of the `@mv_` tokens, applied with `Zmachine::mv`), and the
 playthrough is prefixed with the shortest known path to that token. This is what
 breaks the search out of logjams.
 
+## Threads
+
+`--threads N` runs N independent searches. Each worker owns its own `Search`
+(the state holds `Rc<str>` token names, so it is deliberately not shared) and
+they exchange only plain checkpoints.
+
+- Each worker is seeded from `--seed` plus its worker number; worker 0 keeps the
+  original seed, so `--threads 1` is the old single-threaded, reproducible run.
+- Workers play `--batch` games at a time and report back. The coordinator merges
+  with *best-of-either* rules (earliest `first`, max counts/successes/score,
+  union of stable tokens, shortest known path). That makes merging idempotent:
+  re-syncing the same knowledge cannot inflate the numbers the goal priority is
+  computed from.
+- Every `--sync` games the merged snapshot is handed back to workers, so what
+  one thread discovers steers the others. `--sync 0` makes the workers fully
+  independent until the final merge.
+- Only the coordinator writes the checkpoint, every 10,000 games and on exit.
+  Parallel runs are not bit-for-bit reproducible with a sequential run; use one
+  thread when comparing traces.
+
+## Live display
+
+On a terminal, `zmfuzz` takes over the screen for a live view: a block per
+worker (games, tokens, stable goals, current turn/goal/command), the master's
+token knowledge, the cheapest goals, and a color-coded event log. It uses the
+alternate screen and raw input via `crossterm`; the terminal is restored on exit,
+`q`, `Esc`, or Ctrl-C. `--no-ui` keeps the old per-run lines, and `--ui` forces
+it on even when stdout is redirected (useful for capturing frames). The event
+pane shows `NEWTOKEN` / `REDUCE` / `STABLE` / `SCORE` / `HACK` as they happen;
+`-v` only affects the plain per-run output. `--log` instruction traces go to
+stderr and are not useful with the display.
+
 ## Checkpoints
 
 `--checkpoint` writes `{numplays, stabletoks, stats[]}` as JSON, with best paths
@@ -142,7 +180,7 @@ tokens together.
 ## Tests
 
 ```
-cargo test                          # determinism, checkpoint round trip, v3/v5 runs
+cargo test                          # determinism, checkpoint round trip, merge, v3/v5 runs
 tools/compare.sh minizork.z3 15     # side-by-side with search.js (needs node + jszm)
 ```
 

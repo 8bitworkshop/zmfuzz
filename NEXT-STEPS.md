@@ -29,13 +29,15 @@ Nothing here is tracked by git yet; `git init` if it is going to live in `~/if`.
   `restart()`, `mv()`, `object_count()`.
 - `tests/events.rs` — 3 tests. `README.md` — instrumentation section.
 
-`/tmp/pi-agent/zmfuzz` (~2,100 lines, only dep is encrusted-heart + serde):
+`~/if/zmfuzz` (~2,500 lines; deps: encrusted-heart, serde, crossterm):
 
 | file | what |
 | --- | --- |
 | `src/search.rs` | the `GameRunner` port: goals, priority, replay/shuffle, hackvm, committurn |
+| `src/parallel.rs` | per-worker searches, batch scheduling, checkpoint merge |
+| `src/tui.rs` | live full-screen display (crossterm) |
 | `src/stat.rs` | `Stat`, `Playthrough`, `Turn`, `Score` (ordered by value then name) |
-| `src/checkpoint.rs` | JSON save/load, tokens as strings |
+| `src/checkpoint.rs` | JSON save/load, tokens as strings, idempotent `merge` |
 | `src/ui.rs` | `TokenUI`, one string per print opcode |
 | `src/rng.rs` | xorshift64* |
 | `src/token.rs` | interner |
@@ -47,7 +49,8 @@ content was absorbed by `search.rs` + `ui.rs` + `rng.rs`.
 
 ## Verified
 
-- `cargo test` in zmfuzz: 6 tests pass (2 unit + 4 integration).
+- `cargo test` in zmfuzz: 8 tests pass (4 unit + 6 integration), including merge
+  idempotence and a 2-thread coordinator run.
 - `cargo test` in encrusted-heart: 3 event tests pass.
 - Interpreter regtests: 7/7 (`czech` z3/z4/z5/z8, `praxix`, `curses`, `minizork`).
 - Same seed → byte-identical output (`diff` on 20 plays × 200 turns).

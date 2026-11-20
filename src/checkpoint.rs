@@ -14,14 +14,14 @@ use crate::search::Search;
 use crate::stat::{Stat, Turn, FIRST_UNKNOWN};
 use crate::token::TokenId;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub numplays: u64,
     pub stabletoks: Vec<String>,
     pub stats: Vec<PersistStat>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PersistStat {
     pub token: String,
     pub count: u64,
@@ -35,7 +35,7 @@ pub struct PersistStat {
     pub best: Option<Vec<PersistTurn>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PersistTurn {
     pub cmd: String,
     #[serde(default)]
@@ -144,7 +144,11 @@ impl Search {
                 Stat {
                     // An unknown `first` would sort the token to the back of the
                     // queue; preserved as-is, sentinel included.
-                    first: if p.first > FIRST_UNKNOWN { FIRST_UNKNOWN } else { p.first },
+                    first: if p.first > FIRST_UNKNOWN {
+                        FIRST_UNKNOWN
+                    } else {
+                        p.first
+                    },
                     count: p.count,
                     goalruns: p.goalruns,
                     goalsucc: p.goalsucc,
@@ -163,5 +167,92 @@ impl Search {
         }
         self.reindex();
         self.stat_ids().len()
+    }
+
+    /// Fold another search's knowledge into this one.
+    ///
+    /// Parallel workers start from the same snapshot and then diverge, so the
+    /// merge is idempotent rather than additive: counts and successes take the
+    /// best either side has seen, `first` takes the earliest, stable tokens and
+    /// scores take the union. That keeps repeated syncs from inflating the
+    /// numbers the goal priority is computed from.
+    pub fn merge(&mut self, checkpoint: Checkpoint) {
+        let mut stats: HashMap<TokenId, Stat> = self
+            .stat_ids()
+            .into_iter()
+            .map(|id| (id, self.stat(id).clone()))
+            .collect();
+
+        for p in checkpoint.stats {
+            let id = self.tokens.intern(&p.token).0;
+            let best = p.best.map(|turns| {
+                turns
+                    .into_iter()
+                    .map(|t| Turn {
+                        cmd: t.cmd,
+                        replay: t.replay,
+                        toks: t.toks.iter().map(|s| self.tokens.intern(s).0).collect(),
+                    })
+                    .collect::<Vec<Turn>>()
+            });
+
+            match stats.get_mut(&id) {
+                None => {
+                    stats.insert(
+                        id,
+                        Stat {
+                            first: if p.first > FIRST_UNKNOWN {
+                                FIRST_UNKNOWN
+                            } else {
+                                p.first
+                            },
+                            count: p.count,
+                            goalruns: p.goalruns,
+                            goalsucc: p.goalsucc,
+                            cmds: p.cmds,
+                            stablecount: p.stablecount,
+                            maxscore: p.maxscore,
+                            best,
+                            priority: None,
+                        },
+                    );
+                }
+                Some(stat) => {
+                    stat.count = stat.count.max(p.count);
+                    stat.goalruns = stat.goalruns.max(p.goalruns);
+                    stat.goalsucc = stat.goalsucc.max(p.goalsucc);
+                    stat.stablecount = stat.stablecount.max(p.stablecount);
+                    stat.maxscore = stat.maxscore.max(p.maxscore);
+                    stat.first = stat.first.min(if p.first > FIRST_UNKNOWN {
+                        FIRST_UNKNOWN
+                    } else {
+                        p.first
+                    });
+                    // The path in `best` is "shortest known"; keep whichever
+                    // is shorter, preferring the one already held on a tie.
+                    let keep_current = match (&stat.best, &best) {
+                        (Some(current), Some(incoming)) => current.len() <= incoming.len(),
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        (None, None) => true,
+                    };
+                    if !keep_current {
+                        stat.best = best;
+                    }
+                    for cmd in p.cmds {
+                        if !stat.cmds.contains(&cmd) {
+                            stat.cmds.push(cmd);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.set_stats(stats);
+        for name in checkpoint.stabletoks {
+            let id = self.tokens.intern(&name).0;
+            self.restore_stable(id);
+        }
+        self.reindex();
     }
 }

@@ -236,6 +236,52 @@ Needs a proper full-state API in the VM. Watch memory usage: a snapshot per turn
 for many goals is large; use prefix sharing, deltas, or snapshot only branch
 points. Use the eval harness to compare tokens/second and turns-to-discovery.
 
+#### Path editing, not run splicing
+
+A run is stateful, so a suffix taken from another playthrough is only meaningful
+if it starts from an equivalent VM state. Generic crossover/splicing of `best`
+paths is therefore likely to produce misleading tokens and inflate `first` /
+success statistics. `DIVERGE` only validates replayed turns, not a borrowed
+suffix.
+
+The useful version is path branching:
+
+- replay a selected `best` prefix to turn *k*;
+- replace or mutate the next command (reuse `template_cmd`);
+- continue with random commands, not another run's suffix.
+
+This needs no snapshots and is a cheap experiment while `choose_command` already
+replays prefixes. A/B it with fixed seeds and measure useful turns and new
+tokens per 1,000 turns. Once section 5 lands, branch from a saved node and reuse
+a suffix only when the state matches.
+
+Keep run-splicing/crossover off the table until then: high bookkeeping cost,
+untrusted statistics, and probably worse than a fresh branch from a known state.
+
+#### Save-state branching: staged plan
+
+Do a narrow snapshot/branching spike before the full tree search.
+
+The VM already has private `make_save_state()` and public `load_savestate()`,
+and `XorShiftRng` is `Clone`; the missing piece is an opaque snapshot that also
+captures `paused_instr` and the VM RNG. A Quetzal save alone restores
+memory/frames/PC, not the prompt instruction or host RNG.
+
+Order:
+
+1. Snapshot at each prompt and restore instead of replaying from turn 0. Verify
+   that the same seed and commands produce identical tokens.
+2. Branch at turn *k*: restore, substitute a mutated command (reuse
+   `template_cmd`), and continue randomly. Keep suffix reuse off until state
+   equivalence is proven.
+3. Only then consider persistent per-node snapshots, prefix sharing, and
+   cross-run suffix reuse.
+
+Go/no-go: snapshot-restore must match replay's token stream. If it does not,
+branching will pollute `best` / `first` / success statistics. If replay cost and
+deep paths dominate, this is the right structural step; if parser errors and
+command quality dominate, the context/backoff model is cheaper per new token.
+
 ### 6. Early exit and novelty budget
 
 Currently a game always runs to `maxturns`, even after the goal is met or a

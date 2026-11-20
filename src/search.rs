@@ -27,6 +27,10 @@ const MAX_INSTRUCTIONS_PER_INPUT: usize = 200_000;
 /// Words filtered out of the dictionary: they end or restart the game.
 const IGNORED_WORDS: [&str; 6] = ["restor", "restar", "save", "q", "quit", "zzkjlk"];
 
+/// How many under-explored tokens form the pool an exploration game draws
+/// from. Kept small so exploring still follows the cheapest-first spirit.
+const EXPLORE_POOL: usize = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameEnd {
     /// The game quit (or crashed); `search.js` calls this `DeadError`.
@@ -84,7 +88,12 @@ pub struct Search {
     pub w_distance: f64,
     pub w_untried: f64,
     pub w_success: f64,
+    pub w_fail: f64,
     pub w_stable: f64,
+    /// Goal attempts after which the score bonus has halved.
+    pub score_decay: f64,
+    /// Fraction of games sent to a least-tried token instead of the top ten.
+    pub prob_explore: f64,
     pub verbose: bool,
     pub log_instructions: bool,
     pub checkpoint_path: Option<PathBuf>,
@@ -150,7 +159,10 @@ impl Search {
             w_distance: 1.0,
             w_untried: 4.0,
             w_success: 2.0,
+            w_fail: 10.0,
             w_stable: 1000.0,
+            score_decay: 5.0,
+            prob_explore: 0.2,
             verbose,
             log_instructions: false,
             checkpoint_path: None,
@@ -502,20 +514,56 @@ impl Search {
         self.room.clear();
         self.score.clear();
 
-        // Pick a goal from the ten most attractive tokens.
+        // Pick a goal from the ten most attractive tokens, except for the
+        // exploration quota: some games deliberately target a token outside
+        // the top ten so the queue cannot be monopolised by a few hard goals.
         let candidates: Vec<TokenId> = self.tokfreq.iter().take(10).map(|s| s.token).collect();
-        self.goaltok = if candidates.is_empty() {
-            None
+        let explore = !candidates.is_empty() && self.rng.chance(self.prob_explore);
+        let explored = if explore {
+            self.exploration_goal(&candidates)
         } else {
-            Some(candidates[self.rng.below(candidates.len())])
+            None
+        };
+        self.goaltok = match explored {
+            Some(goal) => Some(goal),
+            None if candidates.is_empty() => None,
+            None => Some(candidates[self.rng.below(candidates.len())]),
         };
 
         if let Some(goal) = self.goaltok {
             if let Some(rec) = self.stats.get_mut(&goal) {
                 rec.goalruns += 1;
+                rec.score_tries += 1;
             }
             self.updatetokfreq(goal);
         }
+    }
+
+    /// Pick a least-tried token, preferring earlier and then alphabetically
+    /// first ones so the choice is stable across processes. Tokens in
+    /// `exclude` (the normal top ten) and stable tokens are skipped.
+    fn exploration_goal(&mut self, exclude: &[TokenId]) -> Option<TokenId> {
+        let mut pool: Vec<(u64, usize, TokenId)> = self
+            .stats
+            .iter()
+            .filter(|(id, stat)| {
+                stat.first > 0
+                    && stat.first < FIRST_UNKNOWN
+                    && !self.stabletoks.contains(id)
+                    && !exclude.contains(id)
+            })
+            .map(|(&id, stat)| (stat.goalruns, stat.first, id))
+            .collect();
+        if pool.is_empty() {
+            return None;
+        }
+        pool.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| self.tokens.name(a.2).cmp(self.tokens.name(b.2)))
+        });
+        pool.truncate(EXPLORE_POOL);
+        Some(pool[self.rng.below(pool.len())].2)
     }
 
     fn endgame(&mut self) {
@@ -674,6 +722,7 @@ impl Search {
         if better {
             if let Some(rec) = self.stats.get_mut(&goal) {
                 rec.maxscore = score;
+                rec.score_tries = 0;
             }
             self.info(format!("SCORE {} {}", self.token_label(goal), score));
             self.updatetokfreq(goal);
@@ -769,22 +818,38 @@ impl Search {
     ///
     /// ```text
     /// first * w_distance + ln(1+goalruns) * w_untried
-    ///   - ln(1+goalsucc) * w_success + stable * w_stable - maxscore * scoremult
+    ///   - ln(1+goalsucc) * w_success
+    ///   + fails * failure_rate * w_fail
+    ///   + stable * w_stable - effective_score
     /// ```
     ///
-    /// Saturating the run/success counts stops one token from dominating; the
-    /// score term is what makes a scored path crowd out everything else.
+    /// `fails` is `goalruns - goalsucc` and `failure_rate` is
+    /// `fails / (goalruns + 1)`: repeated failures should push a goal down, not
+    /// make it more attractive, but a goal with a few successes is not punished
+    /// like one that has never worked. `effective_score` decays with the number
+    /// of attempts since `maxscore` last improved, so one lucky scored run
+    /// cannot pin a token to the top of the queue forever.
     fn updatetokfreq(&mut self, id: TokenId) {
         let stable = self.stabletoks.contains(&id);
 
         let (priority, old) = match self.stats.get_mut(&id) {
             Some(stat) => {
                 let old = stat.priority.take();
+                let fails = stat.goalruns.saturating_sub(stat.goalsucc);
+                let failure_rate = fails as f64 / (stat.goalruns as f64 + 1.0);
+                let failure_penalty = fails as f64 * failure_rate * self.w_fail;
+                let score_bonus = if stat.maxscore > 0 {
+                    stat.maxscore as f64 * self.scoremult
+                        / (1.0 + stat.score_tries as f64 / self.score_decay.max(1.0))
+                } else {
+                    0.0
+                };
                 let value = stat.first as f64 * self.w_distance
                     + (stat.goalruns as f64 + 1.0).ln() * self.w_untried
                     - (stat.goalsucc as f64 + 1.0).ln() * self.w_success
+                    + failure_penalty
                     + if stable { self.w_stable } else { 0.0 }
-                    - stat.maxscore as f64 * self.scoremult;
+                    - score_bonus;
                 // Tokens from the very first turn are uninformative; leave them
                 // out of the queue entirely.
                 let priority = if stat.first > 0 {
@@ -1203,5 +1268,30 @@ mod tests {
     fn alpha_runs_split_on_non_letters() {
         let runs: Vec<&str> = alpha_runs("take the lamp, 2x").collect();
         assert_eq!(runs, vec!["take", "the", "lamp", "x"]);
+    }
+
+    #[test]
+    fn exploration_skips_the_top_ten() {
+        let mut search = Search::new(Vec::new(), 1, 10, false);
+        let mut stats = HashMap::new();
+        let mut top = Vec::new();
+        for i in 0..10 {
+            let id = search.tokens.intern(&format!("top{}", i)).0;
+            let mut stat = Stat::new("x".to_string());
+            stat.first = 1;
+            stat.goalruns = i as u64;
+            stat.goalsucc = i as u64;
+            stats.insert(id, stat);
+            top.push(id);
+        }
+        let outside = search.tokens.intern("outside").0;
+        let mut stat = Stat::new("x".to_string());
+        stat.first = 50;
+        stats.insert(outside, stat);
+        search.set_stats(stats);
+
+        for _ in 0..20 {
+            assert_eq!(search.exploration_goal(&top), Some(outside));
+        }
     }
 }

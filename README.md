@@ -87,7 +87,9 @@ reaches it (`best`), a stability counter, and the best score seen while it was
 the goal.
 
 A game (`play_game`) picks a **goal** at random from the ten most attractive
-tokens, then plays up to `maxturns` turns. At each prompt:
+tokens, then plays up to `maxturns` turns. One game in five (`prob_explore`)
+instead draws from a pool of the least-tried tokens outside that top ten, so a
+few hard goals cannot monopolise the queue. At each prompt:
 
 1. **Commit** the previous turn: add it to the playthrough, bump the counts, and
    for any token seen earlier than ever before, snapshot the playthrough as that
@@ -102,14 +104,25 @@ tokens, then plays up to `maxturns` turns. At each prompt:
      game has printed that are also in its dictionary.
 4. Every `maxturns`-th turn, send `SCORE` first so scoring progress gets recorded.
 
-Priority (lower is more attractive, straight from search.js):
+Priority (lower is more attractive):
 
 ```
-first * 1 + ln(1+goalruns) * 4 - ln(1+goalsucc) * 2 + stable * 1000 - maxscore * 100
+first * 1 + ln(1+goalruns) * 4 - ln(1+goalsucc) * 2
+  + fails * (fails / (goalruns+1)) * 10
+  + stable * 1000
+  - maxscore * 100 / (1 + score_tries / 5)
 ```
+
+where `fails = goalruns - goalsucc` and `score_tries` counts goal attempts since
+`maxscore` last improved. The failure term is weighted by the failure *rate*, so
+a goal that occasionally succeeds is not punished like one that never does. The
+score bonus decays with failed attempts: a lucky score run is chased for a while,
+then released instead of pinning the same ten goals forever. Legacy checkpoints
+without `score_tries` load with `max(goalruns, 20)`, so old score bonuses start
+out decayed.
 
 Saturating the run/success counts stops one token from dominating; the score term
-is what makes a scored path crowd out everything else.
+is what makes a scored path crowd out everything else while it is still fresh.
 
 **VM hacking**: when the chosen goal is stable, with probability
 `stablecount/10` the game starts with an object moved somewhere it cannot
@@ -125,11 +138,12 @@ they exchange only plain checkpoints.
 
 - Each worker is seeded from `--seed` plus its worker number; worker 0 keeps the
   original seed, so `--threads 1` is the old single-threaded, reproducible run.
-- Workers play `--batch` games at a time and report back. The coordinator merges
-  with *best-of-either* rules (earliest `first`, max counts/successes/score,
-  union of stable tokens, shortest known path). That makes merging idempotent:
-  re-syncing the same knowledge cannot inflate the numbers the goal priority is
-  computed from.
+- Workers play `--batch` games at a time and report back. Workers keep their
+  own state between batches; only a sync reloads a master snapshot. Each batch
+  reports `count` / `goalruns` / `goalsucc` as *deltas* from that worker's
+  baseline, and the coordinator adds them. Every game belongs to exactly one
+  worker, so the merged counters are real global totals rather than a max over
+  workers. Paths, `first`, scores and the stable set still merge best-of-either.
 - Every `--sync` games the merged snapshot is handed back to workers, so what
   one thread discovers steers the others. `--sync 0` makes the workers fully
   independent until the final merge.
@@ -170,9 +184,11 @@ are not useful with the display.
 ## Checkpoints
 
 `--checkpoint` writes `{numplays, stabletoks, stats[]}` as JSON, with best paths
-included, on exit and every 10,000 games. If the file exists it is loaded back
-at startup — tokens are re-interned and the goal queue rebuilt — so knowledge
-accumulates across invocations without retyping `--resume`. The random stream
+included, on exit and every 10,000 games. A `score_tries` field records how many
+attempts have passed since the token's best score, so score decay survives a
+resume. If the file exists it is loaded back at startup — tokens are re-interned
+and the goal queue rebuilt — so knowledge accumulates across invocations without
+retyping `--resume`. The random stream
 is reseeded at `seed + numplays`, so each invocation explores new games instead
 of replaying the ones the checkpoint already recorded; a given checkpoint plus
 `--seed` still reproduces a run exactly. `--fresh` ignores
@@ -187,16 +203,17 @@ which is why a resumed search picks the same goals in the same order.
 
 ## Parity with search.js
 
-Kept as-is: constants, priority formula, stability thresholds, replay/shuffle
-probabilities, divergence detection, hackvm odds, the score-token state machine,
-first-turn tokens being excluded from the goal queue, and the `NEWTOKEN` /
-`REDUCE` / `STABLE` / `DIVERGE` / `SCORE` / `HACK` event stream (same messages,
-so traces can be compared by eye or by `tools/compare.sh`).
+Kept as-is: stability thresholds, replay/shuffle probabilities, divergence
+detection, hackvm odds, the score-token state machine, first-turn tokens being
+excluded from the goal queue, and the `NEWTOKEN` / `REDUCE` / `STABLE` /
+`DIVERGE` / `SCORE` / `HACK` event stream (same messages, so traces can be
+compared by eye or by `tools/compare.sh`).
 
 Deliberately different:
 
 | search.js | here | why |
 | --- | --- | --- |
+| fixed priority formula | failure penalty + decaying score + 20% exploration | ten score-6 goals could otherwise pin the queue forever |
 | `Math.random()` | xorshift64* | V8 seeds from entropy; both are reproducible, but not against each other |
 | hangs if the game never reads | `step_with_budget` gives up, run marked `stuck` | a fuzzer should not wedge |
 | writes `monkey.z3.save` next to the story | `./monkey.z3.save` | don't scribble in `encrusted-heart/tests` |
@@ -217,7 +234,7 @@ tokens together.
 ## Tests
 
 ```
-cargo test                          # determinism, checkpoint round trip, merge, v3/v5 runs
+cargo test                          # determinism, checkpoint round trip, merge, score decay, v3/v5 runs
 tools/compare.sh minizork.z3 15     # side-by-side with search.js (needs node + jszm)
 ```
 

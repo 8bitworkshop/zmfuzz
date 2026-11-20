@@ -31,6 +31,8 @@ pub struct PersistStat {
     pub cmds: Vec<String>,
     pub stablecount: i64,
     pub maxscore: i64,
+    /// Goal attempts since `maxscore` last improved.
+    pub score_tries: u64,
     #[serde(default)]
     pub best: Option<Vec<PersistTurn>>,
 }
@@ -60,6 +62,7 @@ impl Search {
                     cmds: stat.cmds.clone(),
                     stablecount: stat.stablecount,
                     maxscore: stat.maxscore,
+                    score_tries: stat.score_tries,
                     best: stat.best.as_ref().map(|turns| {
                         turns
                             .iter()
@@ -155,6 +158,7 @@ impl Search {
                     cmds: p.cmds,
                     stablecount: p.stablecount,
                     maxscore: p.maxscore,
+                    score_tries: p.score_tries,
                     best,
                     priority: None,
                 },
@@ -185,6 +189,7 @@ impl Search {
 
         for p in checkpoint.stats {
             let id = self.tokens.intern(&p.token).0;
+            let incoming_tries = p.score_tries;
             let best = p.best.map(|turns| {
                 turns
                     .into_iter()
@@ -212,6 +217,7 @@ impl Search {
                             cmds: p.cmds,
                             stablecount: p.stablecount,
                             maxscore: p.maxscore,
+                            score_tries: incoming_tries,
                             best,
                             priority: None,
                         },
@@ -222,7 +228,14 @@ impl Search {
                     stat.goalruns = stat.goalruns.max(p.goalruns);
                     stat.goalsucc = stat.goalsucc.max(p.goalsucc);
                     stat.stablecount = stat.stablecount.max(p.stablecount);
-                    stat.maxscore = stat.maxscore.max(p.maxscore);
+                    // Keep `score_tries` paired with the winning score, and
+                    // prefer the freshest attempt count when both sides tie.
+                    if p.maxscore > stat.maxscore {
+                        stat.maxscore = p.maxscore;
+                        stat.score_tries = incoming_tries;
+                    } else if p.maxscore == stat.maxscore && incoming_tries < stat.score_tries {
+                        stat.score_tries = incoming_tries;
+                    }
                     stat.first = stat.first.min(if p.first > FIRST_UNKNOWN {
                         FIRST_UNKNOWN
                     } else {
@@ -230,6 +243,108 @@ impl Search {
                     });
                     // The path in `best` is "shortest known"; keep whichever
                     // is shorter, preferring the one already held on a tie.
+                    let keep_current = match (&stat.best, &best) {
+                        (Some(current), Some(incoming)) => current.len() <= incoming.len(),
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        (None, None) => true,
+                    };
+                    if !keep_current {
+                        stat.best = best;
+                    }
+                    for cmd in p.cmds {
+                        if !stat.cmds.contains(&cmd) {
+                            stat.cmds.push(cmd);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.set_stats(stats);
+        for name in checkpoint.stabletoks {
+            let id = self.tokens.intern(&name).0;
+            self.restore_stable(id);
+        }
+        self.reindex();
+    }
+
+    /// `(count, goalruns, goalsucc)` per token, keyed by name. Workers use it
+    /// as a baseline so each batch can report only the counters it added.
+    pub fn counter_snapshot(&self) -> HashMap<String, (u64, u64, u64)> {
+        self.stat_ids()
+            .into_iter()
+            .map(|id| {
+                let stat = self.stat(id);
+                (
+                    self.tokens.name(id).to_string(),
+                    (stat.count, stat.goalruns, stat.goalsucc),
+                )
+            })
+            .collect()
+    }
+
+    /// Fold a worker batch whose `count`, `goalruns` and `goalsucc` are
+    /// *increments since that worker's baseline*. Unlike [`Self::merge`], those
+    /// three fields are added instead of maxed: every game belongs to exactly
+    /// one worker, so the global totals are the sum of the deltas. Everything
+    /// else (first, best path, stable set, score) is still best-of-either.
+    pub fn merge_delta(&mut self, checkpoint: Checkpoint) {
+        let mut stats: HashMap<TokenId, Stat> = self
+            .stat_ids()
+            .into_iter()
+            .map(|id| (id, self.stat(id).clone()))
+            .collect();
+
+        for p in checkpoint.stats {
+            let id = self.tokens.intern(&p.token).0;
+            let incoming_tries = p.score_tries;
+            let first = if p.first > FIRST_UNKNOWN {
+                FIRST_UNKNOWN
+            } else {
+                p.first
+            };
+            let best = p.best.map(|turns| {
+                turns
+                    .into_iter()
+                    .map(|t| Turn {
+                        cmd: t.cmd,
+                        replay: t.replay,
+                        toks: t.toks.iter().map(|s| self.tokens.intern(s).0).collect(),
+                    })
+                    .collect::<Vec<Turn>>()
+            });
+
+            match stats.get_mut(&id) {
+                None => {
+                    stats.insert(
+                        id,
+                        Stat {
+                            first,
+                            count: p.count,
+                            goalruns: p.goalruns,
+                            goalsucc: p.goalsucc,
+                            cmds: p.cmds,
+                            stablecount: p.stablecount,
+                            maxscore: p.maxscore,
+                            score_tries: incoming_tries,
+                            best,
+                            priority: None,
+                        },
+                    );
+                }
+                Some(stat) => {
+                    stat.count = stat.count.saturating_add(p.count);
+                    stat.goalruns = stat.goalruns.saturating_add(p.goalruns);
+                    stat.goalsucc = stat.goalsucc.saturating_add(p.goalsucc);
+                    stat.stablecount = stat.stablecount.max(p.stablecount);
+                    if p.maxscore > stat.maxscore {
+                        stat.maxscore = p.maxscore;
+                        stat.score_tries = incoming_tries;
+                    } else if p.maxscore == stat.maxscore && incoming_tries < stat.score_tries {
+                        stat.score_tries = incoming_tries;
+                    }
+                    stat.first = stat.first.min(first);
                     let keep_current = match (&stat.best, &best) {
                         (Some(current), Some(incoming)) => current.len() <= incoming.len(),
                         (Some(_), None) => true,

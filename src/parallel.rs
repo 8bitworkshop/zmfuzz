@@ -2,10 +2,12 @@
 //!
 //! The search state is not `Send` (token names are `Rc<str>`), so workers own
 //! their search entirely and only exchange plain [`Checkpoint`] values. Workers
-//! start from the master's snapshot, play a batch, and report back; the master
-//! merges with idempotent "best of either" rules and can periodically hand the
-//! merged snapshot back out so the workers share discoveries.
+//! keep their state between batches; the master adds the counter *deltas* from
+//! each batch (every game belongs to exactly one worker) and merges paths,
+//! scores and the stable set best-of-either. A periodic sync hands the merged
+//! snapshot back so workers can target what the others discovered.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::Duration;
@@ -85,7 +87,11 @@ pub fn run(mut master: Search, opts: Options, ui: Tui) -> Search {
     let mut completed = 0u64;
     let mut last_save = 0u64;
     let mut next_sync = if opts.sync == 0 { u64::MAX } else { opts.sync };
-    let mut sync_snapshot = Some(master.to_checkpoint());
+    let mut sync_snapshot = master.to_checkpoint();
+    // Workers load the snapshot only on their first job and after a sync. On
+    // ordinary batches they keep their own state, so counters and
+    // `stablecount` accumulate instead of being reset every ten games.
+    let mut needs_sync = vec![true; threads];
 
     for (index, job_tx) in job_txs.iter().enumerate() {
         // Spread a small run over all the threads instead of filling the first
@@ -98,8 +104,9 @@ pub fn run(mut master: Search, opts: Options, ui: Tui) -> Search {
             let _ = job_tx.send(Job::Stop);
         } else {
             assigned += give;
+            let checkpoint = take_snapshot(&mut needs_sync[index], &sync_snapshot);
             let _ = job_tx.send(Job::Run {
-                checkpoint: sync_snapshot.clone(),
+                checkpoint,
                 games: give,
             });
         }
@@ -116,7 +123,7 @@ pub fn run(mut master: Search, opts: Options, ui: Tui) -> Search {
                 let worker = batch_result.worker;
                 let vocab = master.vocab_size().max(batch_result.vocab);
                 completed += batch_result.games;
-                master.merge(batch_result.checkpoint);
+                master.merge_delta(batch_result.checkpoint);
                 master.numplays = base_plays + completed;
 
                 if !ui.enabled() {
@@ -156,12 +163,16 @@ pub fn run(mut master: Search, opts: Options, ui: Tui) -> Search {
                     let _ = job_txs[worker].send(Job::Stop);
                 } else {
                     if opts.sync > 0 && completed >= next_sync {
-                        sync_snapshot = Some(master.to_checkpoint());
+                        sync_snapshot = master.to_checkpoint();
                         next_sync = completed.saturating_add(opts.sync);
+                        for pending in &mut needs_sync {
+                            *pending = true;
+                        }
                     }
                     assigned += give;
+                    let checkpoint = take_snapshot(&mut needs_sync[worker], &sync_snapshot);
                     let _ = job_txs[worker].send(Job::Run {
-                        checkpoint: sync_snapshot.clone(),
+                        checkpoint,
                         games: give,
                     });
                 }
@@ -190,7 +201,7 @@ pub fn run(mut master: Search, opts: Options, ui: Tui) -> Search {
 
     for batch_result in result_rx.try_iter() {
         completed += batch_result.games;
-        master.merge(batch_result.checkpoint);
+        master.merge_delta(batch_result.checkpoint);
     }
     master.numplays = base_plays + completed;
     ui.render(&master);
@@ -214,6 +225,7 @@ fn worker(
     search.usetech = events;
     search.checkpoint_path = None;
     search.progress = ui.progress_callback(id);
+    let mut baseline = HashMap::new();
 
     while let Ok(job) = jobs.recv() {
         let (checkpoint, games) = match job {
@@ -223,6 +235,7 @@ fn worker(
 
         if let Some(checkpoint) = checkpoint {
             search.load(checkpoint);
+            baseline = search.counter_snapshot();
         }
 
         let mut batch_events = Vec::new();
@@ -243,7 +256,16 @@ fn worker(
             ui.game_done(id, &search, last_end);
         }
 
-        let checkpoint = search.to_checkpoint();
+        let mut checkpoint = search.to_checkpoint();
+        let current = search.counter_snapshot();
+        for stat in &mut checkpoint.stats {
+            if let Some(&(count, runs, succ)) = baseline.get(&stat.token) {
+                stat.count = stat.count.saturating_sub(count);
+                stat.goalruns = stat.goalruns.saturating_sub(runs);
+                stat.goalsucc = stat.goalsucc.saturating_sub(succ);
+            }
+        }
+        baseline = current;
         let vocab = search.vocab_size();
         if results
             .send(Batch {
@@ -264,6 +286,14 @@ fn worker(
 
 /// Split a user seed into per-worker seeds. Worker 0 keeps the original seed so
 /// `--threads 1` stays byte-for-byte compatible with an unthreaded run.
+fn take_snapshot(needed: &mut bool, snapshot: &Checkpoint) -> Option<Checkpoint> {
+    if std::mem::take(needed) {
+        Some(snapshot.clone())
+    } else {
+        None
+    }
+}
+
 fn worker_seed(seed: u64, id: usize) -> u64 {
     if id == 0 {
         return seed;

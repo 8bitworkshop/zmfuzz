@@ -30,6 +30,16 @@ fn token_names(search: &Search) -> Vec<String> {
     names
 }
 
+fn named_priority(search: &Search, name: &str) -> f64 {
+    let id = search.tokens.get(name).expect("missing token");
+    search
+        .stat(id)
+        .priority
+        .as_ref()
+        .expect("token has no priority")
+        .value
+}
+
 #[test]
 fn same_seed_is_reproducible() {
     let run = || {
@@ -292,4 +302,97 @@ fn reading_names_does_not_disturb_the_search() {
     };
 
     assert_eq!(play(true), play(false), "label lookup drew from the RNG");
+}
+
+#[test]
+fn score_bonus_decays_and_failures_push_goals_down() {
+    use std::collections::HashMap;
+    use zmfuzz::stat::Stat;
+
+    let make = |first, goalruns, goalsucc, maxscore, score_tries| {
+        let mut stat = Stat::new("x".to_string());
+        stat.first = first;
+        stat.count = goalruns * 5;
+        stat.goalruns = goalruns;
+        stat.goalsucc = goalsucc;
+        stat.maxscore = maxscore;
+        stat.score_tries = score_tries;
+        stat
+    };
+
+    let mut search = Search::new(story("minizork.z3"), 1, 20, false);
+    let fresh = search.tokens.intern("score-fresh").0;
+    let aged = search.tokens.intern("score-aged").0;
+    let cold = search.tokens.intern("score-cold").0;
+    let plain = search.tokens.intern("score-plain").0;
+    search.set_stats(HashMap::from([
+        (fresh, make(4, 5, 2, 6, 0)),
+        // Same score and history, but many attempts without improving it.
+        (aged, make(4, 5, 2, 6, 200)),
+        // A goal that has never succeeded: the failure penalty should bury it.
+        (cold, make(5, 20, 0, 0, 0)),
+        (plain, make(5, 0, 0, 0, 0)),
+    ]));
+    search.reindex();
+
+    let pf = named_priority(&search, "score-plain");
+    let p0 = named_priority(&search, "score-fresh");
+    let p200 = named_priority(&search, "score-aged");
+    let pc = named_priority(&search, "score-cold");
+
+    assert!(p0 < pf, "fresh score bonus should still be attractive");
+    assert!(
+        p200 > pf,
+        "score bonus did not decay enough: {} vs {}",
+        p200,
+        pf
+    );
+    assert!(pc > pf, "never-succeeding goal was not penalized");
+}
+
+#[test]
+fn parallel_counters_are_additive_across_workers() {
+    use zmfuzz::parallel;
+    use zmfuzz::tui::{Screen, Tui, TuiConfig};
+
+    let ui = Tui::new(
+        false,
+        TuiConfig {
+            title: "minizork.z3".to_string(),
+            threads: 2,
+            turns: 30,
+            seed: 31,
+            target: 8,
+            checkpoint: String::new(),
+            screen: Screen::Now,
+        },
+    );
+    // Seed the master so every worker game starts with a non-empty goal queue.
+    let mut master = Search::new(story("minizork.z3"), 31, 30, false);
+    master.play_game();
+    let base_plays = master.numplays;
+
+    let merged = parallel::run(
+        master,
+        parallel::Options {
+            story: story("minizork.z3"),
+            threads: 2,
+            seed: 31,
+            turns: 30,
+            events: true,
+            verbose: false,
+            runs: 8,
+            batch: 1,
+            sync: 4,
+        },
+        ui,
+    );
+
+    assert_eq!(merged.numplays, base_plays + 8);
+    let goalruns: u64 = merged
+        .stat_ids()
+        .into_iter()
+        .map(|id| merged.stat(id).goalruns)
+        .sum();
+    assert_eq!(goalruns, 8, "parallel merge lost goal attempts");
 }

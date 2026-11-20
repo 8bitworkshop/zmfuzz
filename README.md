@@ -64,6 +64,20 @@ state change:
 before recording, so `search.js` never makes those tokens. `--no-events` turns
 off the whole `@` family.
 
+The ids are the token's *identity*; everything you see is labelled with object
+names read out of the story's object table:
+
+```
+@mv_112_134   thief → Maze#134
+@f_28_13_1    Behind House flag13=1
+@pp_30_7_1    you prop7=1
+```
+
+Names are suffixed with the object number only when they are ambiguous —
+Mini-Zork has six rooms called `Maze`, and a name without its number would merge
+six distinct moves into one goal. Attribute and property numbers have no names
+anywhere in a story file, so they stay numeric.
+
 ## How it works
 
 Per token, `alltokstats` keeps: how many turns it appeared in, how many times it

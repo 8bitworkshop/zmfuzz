@@ -234,14 +234,13 @@ fn worker(
             last_turns = search.last_turns();
 
             let events = search.take_events();
-            // Worker rows are tracked even headless, so a `--screen` snapshot
-            // at the end of a parallel run is not blank.
-            ui.game_done(id, &search, last_end);
-            if ui.enabled() {
-                ui.push_events(events);
-            } else if verbose {
-                batch_events.extend(events);
+            // Worker rows and events are tracked even headless, so a `--screen`
+            // snapshot at the end of a parallel run is not blank.
+            if verbose && !ui.enabled() {
+                batch_events.extend(events.clone());
             }
+            ui.push_events(events);
+            ui.game_done(id, &search, last_end);
         }
 
         let checkpoint = search.to_checkpoint();

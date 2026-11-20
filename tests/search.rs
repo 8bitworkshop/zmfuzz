@@ -220,3 +220,76 @@ fn parallel_workers_merge_into_the_master() {
     );
     assert!(merged.vocab_size() == 0 || merged.vocab_size() > 100);
 }
+
+#[test]
+fn state_tokens_display_with_object_names() {
+    let mut search = Search::new(story("minizork.z3"), 7, 20, false);
+    search.play_game();
+
+    // Object 30 is the player and 46 is a room in Mini-Zork; the ids stay put,
+    // only the display changes.
+    assert_eq!(search.label("@mv_30_46"), "you → West of House");
+    assert_eq!(search.label("@f_30_8_1"), "you flag8=1");
+    // Six rooms share the name "Maze", so the label has to keep them apart.
+    assert_eq!(search.label("@mv_30_134"), "you → Maze#134");
+    assert_eq!(search.label("@mv_30_57"), "you → Maze#57");
+    // Printed chunks are not tokens and pass through untouched.
+    assert_eq!(search.label("You are in a maze"), "You are in a maze");
+}
+
+#[test]
+fn the_hack_event_names_the_object_it_moves() {
+    use std::collections::HashMap;
+    use zmfuzz::stat::Stat;
+
+    let mut search = Search::new(story("minizork.z3"), 3, 20, false);
+    search.play_game();
+
+    // Make a move token look long-settled so `hackvm` will teleport it: it only
+    // fires on a stable `@mv_` goal at turn 0.
+    let id = search.tokens.intern("@mv_30_46").0;
+    let mut stat = Stat::new("north".to_string());
+    stat.stablecount = 20;
+    search.set_stats(HashMap::from([(id, stat)]));
+    search.restore_stable(id);
+    search.reindex();
+
+    let mut hacks = Vec::new();
+    for _ in 0..200 {
+        search.play_game();
+        hacks.extend(
+            search
+                .take_events()
+                .into_iter()
+                .filter(|event| event.starts_with("HACK ")),
+        );
+        if !hacks.is_empty() {
+            break;
+        }
+    }
+
+    assert!(!hacks.is_empty(), "no HACK in 200 games");
+    assert!(
+        hacks.iter().all(|event| event.contains("you → ")),
+        "HACK line keeps raw ids: {:?}",
+        hacks
+    );
+}
+
+#[test]
+fn reading_names_does_not_disturb_the_search() {
+    let play = |teach: bool| {
+        let mut search = Search::new(story("minizork.z3"), 99, 25, false);
+        if teach {
+            // The parallel coordinator does this before printing its summary.
+            search.ensure_labels();
+            assert_eq!(search.label("@mv_30_46"), "you → West of House");
+        }
+        for _ in 0..3 {
+            search.play_game();
+        }
+        token_names(&search)
+    };
+
+    assert_eq!(play(true), play(false), "label lookup drew from the RNG");
+}

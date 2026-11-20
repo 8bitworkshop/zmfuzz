@@ -14,6 +14,7 @@ use encrusted_heart::traits::VmEvent;
 use encrusted_heart::zmachine::{Step, Zmachine};
 use encrusted_heart::zscii::ZChar;
 
+use crate::labels::Labels;
 use crate::rng::Rng;
 use crate::stat::{Playthrough, Score, Stat, FIRST_UNKNOWN};
 use crate::token::{Interner, TokenId};
@@ -127,6 +128,8 @@ pub struct Search {
     score: String,
     /// `NEWTOKEN` / `STABLE` / `HACK` / ... lines awaiting the display.
     eventbuf: VecDeque<String>,
+    /// Object numbers to names, for the display only; see `labels`.
+    labels: Labels,
 }
 
 impl Search {
@@ -183,6 +186,7 @@ impl Search {
             room: String::new(),
             score: String::new(),
             eventbuf: VecDeque::new(),
+            labels: Labels::default(),
         }
     }
 
@@ -279,6 +283,43 @@ impl Search {
         self.tokens.name(id)
     }
 
+    /// Read the object table for display. The table is static, so once per
+    /// search is enough.
+    fn learn_labels(&mut self, zm: &Zmachine<TokenUI>) {
+        if self.labels.is_empty() {
+            self.labels = Labels::from_tree(&zm.get_object_tree().to_string());
+        }
+    }
+
+    /// Make sure labels exist without playing a game.
+    ///
+    /// The parallel coordinator never plays a game itself, so it would otherwise
+    /// print raw ids in its summary. `machine()` would work but draws from the
+    /// search RNG, and reading names must not disturb the stream.
+    pub fn ensure_labels(&mut self) {
+        if !self.labels.is_empty() {
+            return;
+        }
+        let zm = Zmachine::new(self.story.clone(), TokenUI::new(), Options::default());
+        self.learn_labels(&zm);
+    }
+
+    /// Readable form of a token, for display only. Never feed the result back
+    /// into the search: identity is the raw string, and names are not unique.
+    pub fn label(&self, token: &str) -> String {
+        self.labels.label(token)
+    }
+
+    /// Readable form of an interned token.
+    pub fn token_label(&self, id: TokenId) -> String {
+        self.labels.label(self.tokens.name(id))
+    }
+
+    /// The object table, once a game has run and the story could be read.
+    pub fn labels(&self) -> &Labels {
+        &self.labels
+    }
+
     // --- checkpoint plumbing (checkpoint.rs uses these) ---
 
     pub fn stat_ids(&self) -> Vec<TokenId> {
@@ -334,6 +375,7 @@ impl Search {
         self.newgame();
 
         let mut zm = self.machine();
+        self.learn_labels(&zm);
 
         // Banner and first room description: no `turncmd` yet, so nothing is
         // recorded (search.js: `if (turncmd === null) return`).
@@ -524,12 +566,12 @@ impl Search {
         };
         let goal = self
             .goaltok
-            .map(|id| self.tokens.name(id).to_string())
+            .map(|id| self.token_label(id))
             .unwrap_or_default();
         let tokens = self
             .turntoks
             .iter()
-            .map(|&id| self.tokens.name(id).to_string())
+            .map(|&id| self.token_label(id))
             .collect();
         callback(
             self,
@@ -633,7 +675,7 @@ impl Search {
             if let Some(rec) = self.stats.get_mut(&goal) {
                 rec.maxscore = score;
             }
-            self.info(format!("SCORE {} {}", self.tokens.name(goal), score));
+            self.info(format!("SCORE {} {}", self.token_label(goal), score));
             self.updatetokfreq(goal);
         }
     }
@@ -651,7 +693,7 @@ impl Search {
 
         if !self.stats.contains_key(&id) {
             self.stats.insert(id, Stat::new(cmd.clone()));
-            let name = self.tokens.name(id).to_string();
+            let name = self.token_label(id);
             self.info(format!("NEWTOKEN {} {}", name, cmd));
         }
 
@@ -699,7 +741,7 @@ impl Search {
             if self.stats.contains_key(&id) {
                 self.updatetokfreq(id);
             }
-            self.info(format!("STABLE {}", self.tokens.name(id)));
+            self.info(format!("STABLE {}", self.token_label(id)));
         }
     }
 
@@ -710,7 +752,7 @@ impl Search {
             if self.stats.contains_key(&id) {
                 self.updatetokfreq(id);
             }
-            self.info(format!("UNSTABLE {}", self.tokens.name(id)));
+            self.info(format!("UNSTABLE {}", self.token_label(id)));
         }
     }
 
@@ -828,7 +870,9 @@ impl Search {
                             let runs = stat.goalruns;
                             println!(
                                 "REDUCE {} {} < {} ({}/{}/{})",
-                                self.tokens.name(tok),
+                                // Label via the field: `token_label` would
+                                // borrow all of `self` while `stat` is live.
+                                self.labels.label(self.tokens.name(tok)),
                                 index,
                                 stat.first,
                                 succ,
@@ -1025,7 +1069,9 @@ impl Search {
         let count = zm.object_count();
         if x >= 1 && x <= count && y <= count {
             zm.mv(x, y);
-            self.info(format!("HACK {}", name));
+            // `name` is the raw token (the parse above needs it); the log is
+            // display, so it gets the readable form.
+            self.info(format!("HACK {}", self.token_label(tok)));
         }
         self.hacks.push(tok);
 
@@ -1057,7 +1103,7 @@ impl Search {
     /// The goal this game is currently aiming at.
     pub fn current_goal(&self) -> String {
         self.goaltok
-            .map(|id| self.tokens.name(id).to_string())
+            .map(|id| self.token_label(id))
             .unwrap_or_default()
     }
 

@@ -289,6 +289,10 @@ fn main() {
     // final, scrollback-friendly report.
     ui.finish();
 
+    // A parallel run leaves the coordinator without a single played game, so it
+    // has not read the object table yet; the summary would print raw ids.
+    search.ensure_labels();
+
     // Without a terminal, `--screen X` still gets you the pane: one static
     // frame, wide enough for the tab strip, printed once at the end.
     if !ui_enabled {
@@ -308,7 +312,7 @@ fn main() {
             println!(
                 "  {:10.3}  {:35}  first={} runs={} succ={} stable={} score={}",
                 priority,
-                search.token_name(*id),
+                search.token_label(*id),
                 first,
                 runs,
                 succ,

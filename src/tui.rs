@@ -414,6 +414,24 @@ impl Tui {
         }
         lines.push(footer_line());
         lines.truncate(height.max(1));
+
+        // Names are known, so nothing on screen should still be showing an id.
+        // Cheap insurance: every pane is rendered through here, and a new pane
+        // that forgets to label shows up in tests instead of in a screenshot.
+        #[cfg(debug_assertions)]
+        if !master.labels().is_empty() {
+            for (text, _, _) in &lines {
+                debug_assert!(
+                    !text.contains("@mv_")
+                        && !text.contains("@pp_")
+                        && !text.contains("@f_")
+                        && !text.contains("@store_"),
+                    "raw token reached the screen: {:?}",
+                    text
+                );
+            }
+        }
+
         (lines, content_len, pane_rows)
     }
 
@@ -754,7 +772,7 @@ fn tree_lines(master: &Search) -> Vec<Line> {
     for (priority, id) in queue.iter().take(GOALS) {
         let (first, runs, succ, stable, _score) = master.goal_detail(*id);
         let info = GoalInfo {
-            name: master.token_name(*id).to_string(),
+            name: master.token_label(*id),
             priority: *priority,
             runs,
             succ,
@@ -875,7 +893,7 @@ fn token_lines(master: &Search, rows: usize) -> Vec<Line> {
                 },
                 if stable { "yes" } else { "no" },
                 count,
-                truncate(master.token_name(*id), 46),
+                truncate(&master.token_label(*id), 46),
             ),
             if stable { Color::Green } else { Color::Reset },
             false,
@@ -892,7 +910,7 @@ fn token_lines(master: &Search, rows: usize) -> Vec<Line> {
         ));
         for id in stable.iter().take(8) {
             out.push((
-                format!("  {}", truncate(master.token_name(*id), 60)),
+                format!("  {}", truncate(&master.token_label(*id), 60)),
                 Color::Green,
                 false,
             ));

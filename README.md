@@ -4,10 +4,16 @@ A shortest-path-to-every-atom fuzzer for Z-machine story files: it plays a game
 over and over, records the command sequence that first produced each piece of
 output, then aims the next game at whatever it has seen least.
 
-This is a Rust port of `search.js` from [zzo38's JSZM](https://github.com/zzo38/jszm)
-(search half only, `jszm.js` is not involved). The VM is
+This is a Rust port of `search.js` from
+[sehugg's fork of zzo38's JSZM](https://github.com/sehugg/jszm)
+(search half only, `jszm.js` is not involved.
+For more information see the [blog post](https://8bitworkshop.com/docs/posts/2020/fuzzing-the-z-machine.html).
+)
+
+The VM is
 [`encrusted-heart`](../folly/encrusted-heart), so where the JS version only
 handles v3, this one also plays v4, v5 and v8.
+
 
 ```
 $ cargo run --release -- minizork.z3 --runs 100 --turns 200 -v
@@ -186,3 +192,7 @@ tools/compare.sh minizork.z3 15     # side-by-side with search.js (needs node + 
 
 `encrusted-heart` has its own interpreter conformance suite (`tests/*.regtest`);
 `zmfuzz` only checks the search layer.
+
+# License
+MIT; see `LICENSE`. `encrusted-heart` is linked as a path dependency and is
+itself MIT (Sterling DeMille, Ben Kirwin) — see `../folly/encrusted-heart/LICENSE`.

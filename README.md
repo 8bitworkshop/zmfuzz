@@ -142,6 +142,23 @@ out decayed.
 Saturating the run/success counts stops one token from dominating; the score term
 is what makes a scored path crowd out everything else while it is still fresh.
 
+**Deep goals**: the linear `first` term in the priority makes a token first seen
+at turn 300 unattractive, so a known-but-unreproduced path can otherwise sit in
+the queue forever. Three story-agnostic mechanisms counter that:
+
+- 8% of games (`prob_frontier`) target the deepest token that has a known `best`
+  path and has never been reproduced as a goal;
+- if the chosen goal's `first` (or path length) is beyond `--turns`, that game
+  gets a stretched budget, up to 4x the normal turn limit, so the route is
+  reachable;
+- a `best` path longer than 12 turns is replayed as an ordered sequence, not by
+  retrying only the command that originally produced the token. A path found by
+  a random game is still a path until it diverges, which still abandons the
+  replay for that game.
+
+A success updates the goal's priority immediately, not only when it becomes
+stable, so the queue reflects `goalsucc` as soon as it changes.
+
 **VM hacking**: when the chosen goal is stable, with probability
 `stablecount/10` the game starts with an object moved somewhere it cannot
 normally go (one of the `@mv_` tokens, applied with `Zmachine::mv`), and the
@@ -225,8 +242,8 @@ which is why a resumed search picks the same goals in the same order.
 per-run lines are suppressed): new tokens per 1,000 turns, useful and
 state-changing command rates, state changes per turn, replay divergence,
 average path length, goal-queue health (negative priorities, never-targeted
-tokens, top-ten/exploration shares), and checkpoint size. `tools/bench.sh` is a
-reproducible wrapper — fresh checkpoint, one thread, fixed seed — so an A/B can
+tokens, top-ten/exploration/frontier shares), and checkpoint size.
+`tools/bench.sh` is a reproducible wrapper — fresh checkpoint, one thread, fixed seed — so an A/B can
 be a plain `diff`:
 
 ```

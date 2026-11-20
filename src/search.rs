@@ -31,6 +31,12 @@ const IGNORED_WORDS: [&str; 6] = ["restor", "restar", "save", "q", "quit", "zzkj
 /// from. Kept small so exploring still follows the cheapest-first spirit.
 const EXPLORE_POOL: usize = 32;
 
+/// How many deep, unsolved known paths form the frontier pool. The normal
+/// priority queue is deliberately cheapest-first, which makes a goal first seen
+/// at turn 300 effectively untargetable; a small frontier quota ensures the
+/// search keeps trying to reproduce the deepest thing it has ever seen.
+const FRONTIER_POOL: usize = 32;
+
 /// A verified replay can retire several goals at once, but crediting every
 /// token on a long path would make easy parser responses stable overnight.
 const MAX_REPLAY_CREDITS: usize = 8;
@@ -38,6 +44,15 @@ const MAX_REPLAY_CREDITS: usize = 8;
 /// Successful commands kept as templates. Small enough to stay cheap and to
 /// keep the model from collapsing onto one shape.
 const TEMPLATE_POOL: usize = 256;
+
+/// A best path at least this long is replayed as a sequence. Retrying only the
+/// command that produced the token works when the goal is a turn or two away;
+/// for a far-away goal it throws away the whole route that got there.
+const LONG_PATH_TURNS: isize = 12;
+
+/// Extra turns a game gets when its goal was first seen beyond the normal turn
+/// limit. Without this a deep goal can be selected forever and never reached.
+const TURN_STRETCH_FRACTION: isize = 4;
 
 /// Monotonic run counters that can be summed across parallel workers. The
 /// state-derived parts of [`Metrics`] come from the merged token table instead.
@@ -53,6 +68,7 @@ pub struct RunCounters {
     pub goal_games: u64,
     pub top10_games: u64,
     pub explore_games: u64,
+    pub frontier_games: u64,
 }
 
 impl RunCounters {
@@ -69,6 +85,7 @@ impl RunCounters {
             goal_games: self.goal_games.saturating_sub(earlier.goal_games),
             top10_games: self.top10_games.saturating_sub(earlier.top10_games),
             explore_games: self.explore_games.saturating_sub(earlier.explore_games),
+            frontier_games: self.frontier_games.saturating_sub(earlier.frontier_games),
         }
     }
 
@@ -83,6 +100,7 @@ impl RunCounters {
         self.goal_games = self.goal_games.saturating_add(other.goal_games);
         self.top10_games = self.top10_games.saturating_add(other.top10_games);
         self.explore_games = self.explore_games.saturating_add(other.explore_games);
+        self.frontier_games = self.frontier_games.saturating_add(other.frontier_games);
     }
 }
 
@@ -104,6 +122,7 @@ pub struct Metrics {
     pub goal_games: u64,
     pub top10_games: u64,
     pub explore_games: u64,
+    pub frontier_games: u64,
     pub negative_priorities: usize,
     pub never_targeted: usize,
     pub avg_path_len: f64,
@@ -151,6 +170,9 @@ pub struct Search {
 
     // --- knobs, named after the search.js consts ---
     pub maxturns: isize,
+    /// Turn limit for the game in progress. Normally `maxturns`; stretched when
+    /// the chosen goal's known path is longer than the normal game.
+    game_turns: isize,
     pub usewords: bool,
     pub usetech: bool,
     pub usevmhack: bool,
@@ -172,6 +194,8 @@ pub struct Search {
     pub score_decay: f64,
     /// Fraction of games sent to a least-tried token instead of the top ten.
     pub prob_explore: f64,
+    /// Fraction of games sent to a deep, unsolved goal with a known path.
+    pub prob_frontier: f64,
     /// Fraction of turns that mutate a successful command instead of drawing
     /// two random dictionary words.
     pub prob_template: f64,
@@ -240,6 +264,7 @@ pub struct Search {
     goal_games: u64,
     top10_games: u64,
     explore_games: u64,
+    frontier_games: u64,
     replay_credits: usize,
 
     // --- command templates mined from commands that produced a token ---
@@ -252,6 +277,7 @@ impl Search {
         Search {
             story,
             maxturns,
+            game_turns: maxturns,
             usewords: true,
             usetech: true,
             usevmhack: true,
@@ -269,6 +295,7 @@ impl Search {
             w_stable: 1000.0,
             score_decay: 5.0,
             prob_explore: 0.2,
+            prob_frontier: 0.08,
             prob_template: 0.35,
             verbose,
             log_instructions: false,
@@ -320,6 +347,7 @@ impl Search {
             goal_games: 0,
             top10_games: 0,
             explore_games: 0,
+            frontier_games: 0,
             replay_credits: 0,
             cmdtemplates: Vec::new(),
             cmdtemplateset: HashSet::new(),
@@ -523,6 +551,7 @@ impl Search {
             goal_games: self.goal_games,
             top10_games: self.top10_games,
             explore_games: self.explore_games,
+            frontier_games: self.frontier_games,
             negative_priorities,
             never_targeted,
             avg_path_len: if path_count == 0 {
@@ -546,6 +575,7 @@ impl Search {
             goal_games: self.goal_games,
             top10_games: self.top10_games,
             explore_games: self.explore_games,
+            frontier_games: self.frontier_games,
         }
     }
 
@@ -561,6 +591,7 @@ impl Search {
         self.goal_games = self.goal_games.saturating_add(counters.goal_games);
         self.top10_games = self.top10_games.saturating_add(counters.top10_games);
         self.explore_games = self.explore_games.saturating_add(counters.explore_games);
+        self.frontier_games = self.frontier_games.saturating_add(counters.frontier_games);
     }
 
     // --- checkpoint plumbing (checkpoint.rs uses these) ---
@@ -637,11 +668,11 @@ impl Search {
             self.committurn();
 
             // Out of turns: ask for SCORE once, then stop on the next prompt.
-            if self.numturns == self.maxturns && self.prescoretok.is_some() {
+            if self.numturns == self.game_turns && self.prescoretok.is_some() {
                 self.turncmd = None;
                 self.numturns += 1;
                 zm.handle_input("SCORE".to_string());
-            } else if self.numturns > self.maxturns {
+            } else if self.numturns > self.game_turns {
                 self.endgame();
                 return GameEnd::Turns;
             } else {
@@ -744,6 +775,7 @@ impl Search {
         self.playthru = Playthrough::new();
         self.room.clear();
         self.score.clear();
+        self.game_turns = self.maxturns;
         self.turn_moves.clear();
         self.turn_room_changed = false;
         self.replay_credits = 0;
@@ -765,16 +797,25 @@ impl Search {
             None
         };
         let used_explore = explored.is_some();
-        self.goaltok = match explored {
-            Some(goal) => Some(goal),
-            None if candidates.is_empty() => None,
-            None => Some(candidates[self.rng.below(candidates.len())]),
+        let frontier = if explored.is_none() && self.rng.chance(self.prob_frontier) {
+            self.frontier_goal(&candidates)
+        } else {
+            None
+        };
+        let used_frontier = frontier.is_some();
+        self.goaltok = match (explored, frontier) {
+            (Some(goal), _) => Some(goal),
+            (_, Some(goal)) => Some(goal),
+            (None, None) if candidates.is_empty() => None,
+            (None, None) => Some(candidates[self.rng.below(candidates.len())]),
         };
 
         if self.goaltok.is_some() {
             self.goal_games += 1;
             if used_explore {
                 self.explore_games += 1;
+            } else if used_frontier {
+                self.frontier_games += 1;
             } else {
                 self.top10_games += 1;
             }
@@ -786,6 +827,24 @@ impl Search {
                 rec.score_tries += 1;
             }
             self.updatetokfreq(goal);
+
+            // A goal discovered deep into a long run cannot be reached in a
+            // normal game. Give this game enough turns for its known route,
+            // plus some room to explore beyond it. The cap keeps one very deep
+            // token from making every game arbitrarily expensive.
+            let first = self.stats.get(&goal).map(|s| s.first).unwrap_or(0) as isize;
+            let path = self
+                .stats
+                .get(&goal)
+                .and_then(|s| s.best.as_ref())
+                .map(|b| b.len() as isize)
+                .unwrap_or(0);
+            let reach = first.max(path);
+            if reach > self.maxturns {
+                let stretch = self.maxturns / TURN_STRETCH_FRACTION.max(1);
+                let cap = self.maxturns.saturating_mul(4);
+                self.game_turns = self.maxturns.max((reach + stretch).min(cap));
+            }
         }
     }
 
@@ -814,6 +873,40 @@ impl Search {
                 .then_with(|| self.tokens.name(a.2).cmp(self.tokens.name(b.2)))
         });
         pool.truncate(EXPLORE_POOL);
+        Some(pool[self.rng.below(pool.len())].2)
+    }
+
+    /// Pick a deep token with a known route that has never been reproduced as
+    /// a goal. This is the complement of `exploration_goal`: exploration tries
+    /// things never attempted, the frontier retries the far edge of what is
+    /// already known. Without it, the linear `first` penalty in the priority
+    /// formula can keep a late-game goal out of the queue forever.
+    fn frontier_goal(&mut self, exclude: &[TokenId]) -> Option<TokenId> {
+        let mut pool: Vec<(usize, u64, TokenId)> = self
+            .stats
+            .iter()
+            .filter(|(id, stat)| {
+                stat.first > 0
+                    && stat.first < FIRST_UNKNOWN
+                    && stat.goalsucc == 0
+                    && stat.best.as_ref().is_some_and(|b| !b.is_empty())
+                    && !self.stabletoks.contains(id)
+                    && !exclude.contains(id)
+                    && !self.is_ambient(**id)
+            })
+            .map(|(&id, stat)| (stat.first, stat.goalruns, id))
+            .collect();
+        if pool.is_empty() {
+            return None;
+        }
+        // Deepest first; ties go to the least-attempted, then name for stable
+        // output across processes.
+        pool.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| self.tokens.name(a.2).cmp(self.tokens.name(b.2)))
+        });
+        pool.truncate(FRONTIER_POOL);
         Some(pool[self.rng.below(pool.len())].2)
     }
 
@@ -1073,6 +1166,9 @@ impl Search {
         } else if (stablecount as f64) < thresh / 2.0 {
             self.makeunstable(id);
         }
+        // `goalsucc` is part of the priority, but a success that does not yet
+        // cross the stability threshold used to leave the queue entry stale.
+        self.updatetokfreq(id);
     }
 
     /// A verified replay precedes the goal: every token first discovered on one
@@ -1480,8 +1576,18 @@ impl Search {
 
         if let Some(best) = best {
             let turn = best.get(self.numturns.max(0) as usize).cloned();
+            // A path found by a random game is still a path: replay it in
+            // order when the goal is far enough away that retrying just the
+            // final command cannot work. `turn.replay` only says the snapshot
+            // was itself recorded during a replay, not that the path is valid.
+            let long_path = first as isize >= LONG_PATH_TURNS;
 
-            if !self.replaydiverged && goalruns <= 2 && turn.is_some() {
+            if !self.replaydiverged && long_path && turn.is_some() {
+                let turn = turn.unwrap();
+                cmd = Some(turn.cmd);
+                self.turnisreplay = true;
+                self.expectedtoks = Some(turn.toks);
+            } else if !self.replaydiverged && goalruns <= 2 && turn.is_some() {
                 let turn = turn.unwrap();
                 if turn.replay {
                     // Stick to the recorded replay verbatim.

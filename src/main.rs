@@ -399,6 +399,7 @@ fn print_stats(search: &Search, checkpoint: Option<&PathBuf>) {
     println!("goal_games={}", metrics.goal_games);
     println!("top10_share={:.4}", share(metrics.top10_games));
     println!("explore_share={:.4}", share(metrics.explore_games));
+    println!("frontier_share={:.4}", share(metrics.frontier_games));
     println!("negative_priorities={}", metrics.negative_priorities);
     println!("never_targeted={}", metrics.never_targeted);
     if let Some(path) = checkpoint {

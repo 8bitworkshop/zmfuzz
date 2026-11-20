@@ -1,0 +1,16 @@
+[package]
+name = "zmfuzz"
+version = "0.1.0"
+edition = "2021"
+description = "Fuzz a Z-machine story file for the shortest path to every output (port of search.js)"
+license = "MIT"
+
+# Deliberately its own workspace root: `folly`'s graph pulls armrest -> tflite
+# -> the tensorflow git submodule, which resolves even for `-p encrusted-heart`.
+[workspace]
+
+[dependencies]
+encrusted-heart = { path = "../folly/encrusted-heart" }
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = "1.0"

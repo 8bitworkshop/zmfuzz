@@ -188,6 +188,15 @@ impl Search {
         self.stats.len()
     }
 
+    /// Best score any token has reached across the whole search.
+    pub fn top_score(&self) -> i64 {
+        self.stats
+            .values()
+            .map(|stat| stat.maxscore)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.vocab.as_ref().map(|v| v.len()).unwrap_or(0)
     }

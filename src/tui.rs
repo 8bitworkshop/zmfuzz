@@ -337,10 +337,11 @@ impl Tui {
             .unwrap_or(0);
         lines.push((
             format!(
-                " KNOWLEDGE  tokens {}  vocab {}  stable {}  goal queue {}",
+                " KNOWLEDGE  tokens {}  vocab {}  stable {}  score {}  goal queue {}",
                 master.token_count(),
                 master.vocab_size().max(worker_vocab),
                 master.stable_count(),
+                master.top_score(),
                 master.goal_queue().len()
             ),
             Color::White,

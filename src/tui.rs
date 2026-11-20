@@ -402,6 +402,9 @@ impl Tui {
                 out,
                 SetForegroundColor(*color),
                 Print(fit(text, width.saturating_sub(1))),
+                // Erase the tail of a previously longer line: event messages
+                // shrink and grow, and \r\n alone would leave the old text.
+                Clear(ClearType::UntilNewLine),
                 ResetColor,
                 SetAttribute(Attribute::Reset)
             )?;

@@ -56,6 +56,11 @@ pub fn run(mut master: Search, opts: Options, ui: Tui) -> Search {
     let base_plays = master.numplays;
     let checkpoint_path = master.checkpoint_path.clone();
 
+    // The coordinator never plays a game, so unless it reads the object table
+    // itself every live pane will show raw `@mv_...` ids. This does not touch
+    // the search RNG (see `ensure_labels`).
+    master.ensure_labels();
+
     let (result_tx, result_rx) = mpsc::channel::<Batch>();
     let mut job_txs: Vec<Sender<Job>> = Vec::new();
     let mut handles = Vec::new();

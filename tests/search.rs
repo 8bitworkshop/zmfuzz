@@ -229,6 +229,9 @@ fn parallel_workers_merge_into_the_master() {
         merged.token_count()
     );
     assert!(merged.vocab_size() == 0 || merged.vocab_size() > 100);
+    // The coordinator must read the object table even though it never plays,
+    // or the live token/tree panes show raw `@mv_...` ids.
+    assert_eq!(merged.label("@mv_30_46"), "you → West of House");
 }
 
 #[test]

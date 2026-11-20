@@ -20,6 +20,7 @@ struct Args {
     log: bool,
     verbose: bool,
     events: bool,
+    stats: bool,
     ui: Option<bool>,
     checkpoint: Option<PathBuf>,
     resume: bool,
@@ -50,6 +51,7 @@ OPTIONS:
     --fresh        ignore an existing checkpoint and start blank
     --replay F     feed commands from F, print the tokens each turn produced
     --no-events    ignore VM side effects (text tokens only)
+    --stats        print aggregate search metrics (implies quiet run lines)
     --log          trace every VM instruction on stderr (very noisy)
     --ui           live full-screen display (default: on when stdout is a TTY)
     --no-ui        plain per-run output even on a terminal
@@ -74,6 +76,7 @@ fn parse_args() -> Args {
         log: false,
         verbose: false,
         events: true,
+        stats: false,
         ui: None,
         checkpoint: None,
         resume: false,
@@ -107,6 +110,7 @@ fn parse_args() -> Args {
             "--screen" => args.screen = Some(next_value(&mut it, "--screen")),
             "--log" => args.log = true,
             "--no-events" => args.events = false,
+            "--stats" => args.stats = true,
             "--ui" => args.ui = Some(true),
             "--no-ui" => args.ui = Some(false),
             "-v" | "--verbose" => args.verbose = true,
@@ -179,6 +183,7 @@ fn main() {
     let mut search = Search::new(story, args.seed, args.turns, args.verbose && !ui_enabled);
     search.log_instructions = args.log;
     search.usetech = args.events;
+    search.quiet_runs = args.stats;
     search.checkpoint_path = args.checkpoint.clone();
 
     if let Some(path) = &args.replay {
@@ -280,6 +285,7 @@ fn main() {
                 runs: args.runs,
                 batch: args.batch,
                 sync: args.sync,
+                quiet: args.stats,
             },
             ui.clone(),
         )
@@ -328,6 +334,78 @@ fn main() {
             Err(e) => eprintln!("\nzmfuzz: cannot write {}: {}", path.display(), e),
         }
     }
+
+    if args.stats {
+        print_stats(&search, args.checkpoint.as_ref());
+    }
+}
+
+/// The numbers `IDEAS.md` asks an evaluation harness to report. Machine-friendly
+/// `key=value` lines so `tools/bench.sh` can diff two runs.
+fn print_stats(search: &Search, checkpoint: Option<&PathBuf>) {
+    let metrics = search.metrics();
+    let per_1k = |n: u64, d: u64| {
+        if d == 0 {
+            0.0
+        } else {
+            n as f64 * 1000.0 / d as f64
+        }
+    };
+    let rate = |n: u64, d: u64| {
+        if d == 0 {
+            0.0
+        } else {
+            n as f64 / d as f64
+        }
+    };
+    let share = |n: u64| {
+        if metrics.goal_games == 0 {
+            0.0
+        } else {
+            n as f64 / metrics.goal_games as f64
+        }
+    };
+
+    println!("\n== stats ==");
+    println!("plays={}", metrics.plays);
+    println!("turns={}", metrics.turns);
+    println!("tokens={}", metrics.tokens);
+    println!("stable={}", metrics.stable);
+    println!(
+        "newtokens_per_1k_turns={:.3}",
+        per_1k(metrics.newtokens, metrics.turns)
+    );
+    println!(
+        "stable_per_1k_games={:.3}",
+        per_1k(metrics.stable as u64, metrics.plays)
+    );
+    println!(
+        "useful_command_rate={:.4}",
+        rate(metrics.useful_turns, metrics.turns)
+    );
+    println!(
+        "state_changing_command_rate={:.4}",
+        rate(metrics.state_turns, metrics.turns)
+    );
+    println!(
+        "state_changes_per_turn={:.4}",
+        rate(metrics.state_changes, metrics.turns)
+    );
+    println!(
+        "replay_divergence_rate={:.4}",
+        rate(metrics.diverged_turns, metrics.replay_turns)
+    );
+    println!("avg_path_len={:.2}", metrics.avg_path_len);
+    println!("goal_games={}", metrics.goal_games);
+    println!("top10_share={:.4}", share(metrics.top10_games));
+    println!("explore_share={:.4}", share(metrics.explore_games));
+    println!("negative_priorities={}", metrics.negative_priorities);
+    println!("never_targeted={}", metrics.never_targeted);
+    if let Some(path) = checkpoint {
+        if let Ok(meta) = std::fs::metadata(path) {
+            println!("checkpoint_bytes={}", meta.len());
+        }
+    }
 }
 
 fn run_sequential(mut search: Search, runs: u64, ui: &Tui) -> Search {
@@ -352,7 +430,7 @@ fn run_sequential(mut search: Search, runs: u64, ui: &Tui) -> Search {
         ui.game_done(0, &search, end);
         if ui.enabled() {
             ui.render(&search);
-        } else {
+        } else if !search.quiet_runs {
             println!(
                 "run {:3}: plays={} turns={:3} tokens={:5} vocab={:4} stable={:3} {}",
                 done,

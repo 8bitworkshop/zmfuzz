@@ -123,6 +123,11 @@ impl Search {
     pub fn load(&mut self, checkpoint: Checkpoint) -> usize {
         self.numplays = checkpoint.numplays;
 
+        // The goal queue excludes ambient moves, which needs the object table.
+        // Read it here so a loaded search queues the same goals as the one that
+        // wrote the checkpoint, even before it plays a game.
+        self.ensure_labels();
+
         let stable: Vec<TokenId> = checkpoint
             .stabletoks
             .iter()

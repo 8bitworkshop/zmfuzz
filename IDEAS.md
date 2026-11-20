@@ -18,6 +18,20 @@ Recent changes:
 - The parallel coordinator reads the object table at startup, so live token and
   tree panes show names rather than raw `@mv_...` ids.
 
+Landed this round (ideas 1-4 from the roadmap):
+
+- `--stats` and `tools/bench.sh` report tokens per turn, useful/state-changing
+  command rates, replay divergence, path length, and goal-queue health.
+- Moves are classified as player-driven or ambient. The player object comes
+  from the object table or the first room change; NPC moves are excluded from
+  the goal queue and `hackvm`. Moves into the player's inventory are kept.
+- Verified replays credit other goals first discovered on their prefix, capped
+  per game.
+- Commands that changed state, a room, or revealed new text are mined as word
+  templates; generation mutates one slot instead of drawing two random words.
+  "Useful" deliberately excludes plain parser-error text unless that text is
+  new.
+
 Baseline measurements from the current checkpoint:
 
 | run | tokens | stable | notes |
@@ -34,7 +48,10 @@ dictionary-word commands. That is the next large inefficiency.
 
 ## Prioritized roadmap
 
-### 0. Build an evaluation harness first
+### 0. Build an evaluation harness first — done
+
+`--stats` plus `tools/bench.sh`. Use `--fresh --no-ui --threads 1` with a fixed
+seed for A/B runs.
 
 Every idea below needs a cheap way to tell whether it helped. Add a `--stats`
 mode (or a small `tools/bench.sh`) that reports, for the same seed/checkpoint:
@@ -52,7 +69,12 @@ mode (or a small `tools/bench.sh`) that reports, for the same seed/checkpoint:
 Use `--no-ui` and one thread for reproducible A/B runs. This is the prerequisite
 for everything else.
 
-### 1. Separate actionable goals from ambient world changes
+### 1. Separate actionable goals from ambient world changes — done
+
+The implementation is deliberately cheap: player/ambient classification plus
+inventory pickups. The remaining bullets (per-goal replay-divergence tracking,
+player-driven item moves beyond inventory) are still open if they earn their
+keep.
 
 The search currently treats every `@mv_*` token as a goal, including NPC moves.
 In Mini-Zork `@mv_112_*` is the thief and `@mv_30_*` is the player. Chasing
@@ -99,7 +121,11 @@ Quick determinism check: log `VmEvent::Random` (currently ignored in
 us whether the thief is scripted or RNG-driven, but the classification fix is
 worth doing either way.
 
-### 2. Multi-goal credit and token bundles
+### 2. Multi-goal credit and token bundles — partially done
+
+Replay-prefix credit is in (capped at 8 per game). Bundling co-produced tokens
+into one observation is still open; the per-token credit above is the cheap
+version of the same idea.
 
 Cheap, high impact, and independent of command generation.
 
@@ -121,7 +147,11 @@ Ideas:
 Watch out for inflating easy parser-response tokens. Cap credit per game or
 require the token to be on the recorded `best` path.
 
-### 3. Command templates and mutation (stage 1 of the command model)
+### 3. Command templates and mutation (stage 1 of the command model) — done
+
+Mining and single-slot mutation are in. Templates are in-memory only (not in
+the checkpoint), which is enough to measure the effect; making them persistent
+is a later step if the useful-command rate improves.
 
 `getrandomcmd` currently picks 1–2 dictionary words, half from recent output.
 Most turns are parser errors. Before building a full contextual model, mine the
@@ -313,16 +343,15 @@ behind flags; otherwise update the parity table and comparisons.
 
 ## Suggested order
 
-1. Evaluation harness (`--stats` / `tools/bench.sh`).
-2. Separate actionable goals from ambient NPC/world changes.
-3. Multi-goal credit and token bundles.
-4. Command template mining and mutation.
+1. Evaluation harness (`--stats` / `tools/bench.sh`). — done
+2. Separate actionable goals from ambient NPC/world changes. — done (cheap form)
+3. Multi-goal credit and token bundles. — replay-prefix credit done
+4. Command template mining and mutation. — done (in-memory)
 5. Context collection (room/inventory/objects) + backoff command model.
 6. Inference chains / precondition priors.
 7. Save-state tree search.
 8. Early exit, heuristic tuning, parallel sharding.
 9. Checkpoint autosave, pruning, and TUI polish in parallel with the above.
 
-The first four are small enough to land and measure quickly. Save-state search
-is the largest payoff but should come after the harness and multi-goal credit so
-we can tell whether it is actually winning.
+The first four have landed; the next step is to measure them with `bench.sh` and
+then decide whether context collection or save-state search buys more per hour.

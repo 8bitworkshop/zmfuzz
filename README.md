@@ -44,6 +44,7 @@ zmfuzz <story.z3> [options]
   --checkpoint F read/write search state at F (default ./<story>.save)
   --fresh        ignore an existing checkpoint and start a blank search
   --no-events    ignore VM side effects (text tokens only)
+  --stats        print aggregate search metrics (implies quiet run lines)
   --ui           live full-screen display (default: on when stdout is a TTY)
   --no-ui        plain per-run output even on a terminal
   --screen S     start on pane S: now tree map tokens workers log (or 1-6)
@@ -77,6 +78,23 @@ Names are suffixed with the object number only when they are ambiguous —
 Mini-Zork has six rooms called `Maze`, and a name without its number would merge
 six distinct moves into one goal. Attribute and property numbers have no names
 anywhere in a story file, so they stay numeric.
+
+Moves are split into player-driven and ambient. The player object is read from
+the object table (`you`, `yourself`, ...) or inferred from the first room change,
+and a move by any other object is *ambient*: NPC movement that no command can
+control. Ambient tokens stay in the statistics and the display, but never enter
+the goal queue or `hackvm`. Moves *into* the player's inventory are kept, so
+`take egg` remains a real goal. This is what stops surprising amounts of time
+going into "thief → Maze#57".
+
+A verified replay credits the goals it reproduced, not just the chosen one.
+Every token first discovered on an intentional replay turn (capped at a few per
+game) gets a success too, so one good run can retire a prefix's worth of goals.
+
+Commands that actually changed something — a state token, a room change, or
+text never seen before — are mined as word templates. A later turn can take one
+of those commands and mutate a single slot, which is much more likely to parse
+than two random dictionary words.
 
 ## How it works
 
@@ -201,6 +219,23 @@ Note that token ids are per-process: a resumed search assigns ids in checkpoint
 order, so ids are not comparable across runs. Goals are queued by name, not id,
 which is why a resumed search picks the same goals in the same order.
 
+## Evaluation
+
+`--stats` prints a machine-friendly block after a run (and implies the noisy
+per-run lines are suppressed): new tokens per 1,000 turns, useful and
+state-changing command rates, state changes per turn, replay divergence,
+average path length, goal-queue health (negative priorities, never-targeted
+tokens, top-ten/exploration shares), and checkpoint size. `tools/bench.sh` is a
+reproducible wrapper — fresh checkpoint, one thread, fixed seed — so an A/B can
+be a plain `diff`:
+
+```
+tools/bench.sh minizork.z3 400 200 1 > before.txt
+# ...make a change...
+tools/bench.sh minizork.z3 400 200 1 > after.txt
+diff before.txt after.txt
+```
+
 ## Parity with search.js
 
 Kept as-is: stability thresholds, replay/shuffle probabilities, divergence
@@ -214,6 +249,9 @@ Deliberately different:
 | search.js | here | why |
 | --- | --- | --- |
 | fixed priority formula | failure penalty + decaying score + 20% exploration | ten score-6 goals could otherwise pin the queue forever |
+| every `@mv_*` is a goal | player moves and inventory pickups only; NPC moves are ambient | chasing the thief is not actionable |
+| one goal credited per run | verified replays also credit discoveries on their prefix | one run validates many goals |
+| random dictionary words | mined command templates, one slot mutated | fewer parser errors per turn |
 | `Math.random()` | xorshift64* | V8 seeds from entropy; both are reproducible, but not against each other |
 | hangs if the game never reads | `step_with_budget` gives up, run marked `stuck` | a fuzzer should not wedge |
 | writes `monkey.z3.save` next to the story | `./monkey.z3.save` | don't scribble in `encrusted-heart/tests` |

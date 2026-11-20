@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::checkpoint::Checkpoint;
-use crate::search::{GameEnd, Search};
+use crate::search::{GameEnd, RunCounters, Search};
 use crate::tui::Tui;
 
 pub struct Options {
@@ -27,6 +27,8 @@ pub struct Options {
     pub batch: u64,
     /// Re-share merged knowledge every N games (0 = only at the end).
     pub sync: u64,
+    /// Suppress per-batch lines; the coordinator reports `--stats` instead.
+    pub quiet: bool,
 }
 
 enum Job {
@@ -45,6 +47,7 @@ struct Batch {
     last_turns: isize,
     last_end: GameEnd,
     vocab: usize,
+    counters: RunCounters,
 }
 
 /// Play games on `threads` workers, folding their findings into `master`.
@@ -129,9 +132,10 @@ pub fn run(mut master: Search, opts: Options, ui: Tui) -> Search {
                 let vocab = master.vocab_size().max(batch_result.vocab);
                 completed += batch_result.games;
                 master.merge_delta(batch_result.checkpoint);
+                master.add_run_counters(&batch_result.counters);
                 master.numplays = base_plays + completed;
 
-                if !ui.enabled() {
+                if !ui.enabled() && !opts.quiet {
                     for event in &batch_result.events {
                         println!("{}", event);
                     }
@@ -207,6 +211,7 @@ pub fn run(mut master: Search, opts: Options, ui: Tui) -> Search {
     for batch_result in result_rx.try_iter() {
         completed += batch_result.games;
         master.merge_delta(batch_result.checkpoint);
+        master.add_run_counters(&batch_result.counters);
     }
     master.numplays = base_plays + completed;
     ui.render(&master);
@@ -231,6 +236,7 @@ fn worker(
     search.checkpoint_path = None;
     search.progress = ui.progress_callback(id);
     let mut baseline = HashMap::new();
+    let mut last_counters = RunCounters::default();
 
     while let Ok(job) = jobs.recv() {
         let (checkpoint, games) = match job {
@@ -272,6 +278,9 @@ fn worker(
         }
         baseline = current;
         let vocab = search.vocab_size();
+        let counters_now = search.run_counters();
+        let counters = counters_now.delta_since(&last_counters);
+        last_counters = counters_now;
         if results
             .send(Batch {
                 worker: id,
@@ -281,6 +290,7 @@ fn worker(
                 last_turns,
                 last_end,
                 vocab,
+                counters,
             })
             .is_err()
         {

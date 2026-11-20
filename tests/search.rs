@@ -218,6 +218,7 @@ fn parallel_workers_merge_into_the_master() {
             runs: 4,
             batch: 1,
             sync: 2,
+            quiet: true,
         },
         ui,
     );
@@ -387,6 +388,7 @@ fn parallel_counters_are_additive_across_workers() {
             runs: 8,
             batch: 1,
             sync: 4,
+            quiet: true,
         },
         ui,
     );

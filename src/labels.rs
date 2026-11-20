@@ -74,6 +74,30 @@ impl Labels {
         self.names.is_empty()
     }
 
+    /// Plain name of an object, without the disambiguating `#number`. Used to
+    /// match a move's destination against the status-bar room string.
+    pub fn plain_object(&self, number: u16) -> Option<&str> {
+        self.names.get(&number).map(|name| name.as_str())
+    }
+
+    /// Best guess at the player object, from its conventional name. Stories
+    /// almost always call it one of these; `Search` learns it from room moves
+    /// when they do not.
+    pub fn player(&self) -> Option<u16> {
+        const NAMES: [&str; 5] = ["you", "yourself", "adventurer", "player", "me"];
+        self.names
+            .iter()
+            .find(|(_, name)| NAMES.iter().any(|n| name.eq_ignore_ascii_case(n)))
+            .map(|(&number, _)| number)
+            .or_else(|| {
+                // Fall back to a name that starts with "you" ("yourself").
+                self.names
+                    .iter()
+                    .find(|(_, name)| name.to_ascii_lowercase().starts_with("you"))
+                    .map(|(&number, _)| number)
+            })
+    }
+
     /// Name of an object, numbered only when the name is shared.
     pub fn object(&self, number: u16) -> String {
         match self.names.get(&number) {
@@ -165,6 +189,13 @@ mod tests {
         // Object 0 and the nameless container are skipped.
         assert_eq!(labels.object(0), "obj0");
         assert_eq!(labels.object(27), "obj27");
+    }
+
+    #[test]
+    fn player_is_found_by_name() {
+        assert_eq!(labels().player(), Some(30));
+        assert_eq!(Labels::from_tree("nothing here").player(), None);
+        assert_eq!(Labels::from_tree("Yourself (7)\n").player(), Some(7));
     }
 
     #[test]

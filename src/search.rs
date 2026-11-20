@@ -31,6 +31,84 @@ const IGNORED_WORDS: [&str; 6] = ["restor", "restar", "save", "q", "quit", "zzkj
 /// from. Kept small so exploring still follows the cheapest-first spirit.
 const EXPLORE_POOL: usize = 32;
 
+/// A verified replay can retire several goals at once, but crediting every
+/// token on a long path would make easy parser responses stable overnight.
+const MAX_REPLAY_CREDITS: usize = 8;
+
+/// Successful commands kept as templates. Small enough to stay cheap and to
+/// keep the model from collapsing onto one shape.
+const TEMPLATE_POOL: usize = 256;
+
+/// Monotonic run counters that can be summed across parallel workers. The
+/// state-derived parts of [`Metrics`] come from the merged token table instead.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunCounters {
+    pub turns: u64,
+    pub useful_turns: u64,
+    pub state_turns: u64,
+    pub newtokens: u64,
+    pub state_changes: u64,
+    pub replay_turns: u64,
+    pub diverged_turns: u64,
+    pub goal_games: u64,
+    pub top10_games: u64,
+    pub explore_games: u64,
+}
+
+impl RunCounters {
+    /// Counters added since `earlier`, saturating rather than wrapping.
+    pub fn delta_since(&self, earlier: &RunCounters) -> RunCounters {
+        RunCounters {
+            turns: self.turns.saturating_sub(earlier.turns),
+            useful_turns: self.useful_turns.saturating_sub(earlier.useful_turns),
+            state_turns: self.state_turns.saturating_sub(earlier.state_turns),
+            newtokens: self.newtokens.saturating_sub(earlier.newtokens),
+            state_changes: self.state_changes.saturating_sub(earlier.state_changes),
+            replay_turns: self.replay_turns.saturating_sub(earlier.replay_turns),
+            diverged_turns: self.diverged_turns.saturating_sub(earlier.diverged_turns),
+            goal_games: self.goal_games.saturating_sub(earlier.goal_games),
+            top10_games: self.top10_games.saturating_sub(earlier.top10_games),
+            explore_games: self.explore_games.saturating_sub(earlier.explore_games),
+        }
+    }
+
+    pub fn add(&mut self, other: &RunCounters) {
+        self.turns = self.turns.saturating_add(other.turns);
+        self.useful_turns = self.useful_turns.saturating_add(other.useful_turns);
+        self.state_turns = self.state_turns.saturating_add(other.state_turns);
+        self.newtokens = self.newtokens.saturating_add(other.newtokens);
+        self.state_changes = self.state_changes.saturating_add(other.state_changes);
+        self.replay_turns = self.replay_turns.saturating_add(other.replay_turns);
+        self.diverged_turns = self.diverged_turns.saturating_add(other.diverged_turns);
+        self.goal_games = self.goal_games.saturating_add(other.goal_games);
+        self.top10_games = self.top10_games.saturating_add(other.top10_games);
+        self.explore_games = self.explore_games.saturating_add(other.explore_games);
+    }
+}
+
+/// Version-independent snapshot of the search's work, for `--stats` and
+/// `tools/bench.sh`. Ratios are left to the caller so the raw counters stay
+/// meaningful when comparing runs.
+#[derive(Debug, Clone, Default)]
+pub struct Metrics {
+    pub plays: u64,
+    pub turns: u64,
+    pub tokens: usize,
+    pub stable: usize,
+    pub newtokens: u64,
+    pub useful_turns: u64,
+    pub state_turns: u64,
+    pub state_changes: u64,
+    pub replay_turns: u64,
+    pub diverged_turns: u64,
+    pub goal_games: u64,
+    pub top10_games: u64,
+    pub explore_games: u64,
+    pub negative_priorities: usize,
+    pub never_targeted: usize,
+    pub avg_path_len: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameEnd {
     /// The game quit (or crashed); `search.js` calls this `DeadError`.
@@ -94,8 +172,13 @@ pub struct Search {
     pub score_decay: f64,
     /// Fraction of games sent to a least-tried token instead of the top ten.
     pub prob_explore: f64,
+    /// Fraction of turns that mutate a successful command instead of drawing
+    /// two random dictionary words.
+    pub prob_template: f64,
     pub verbose: bool,
     pub log_instructions: bool,
+    /// Suppress the per-run lines; `--stats` reports the aggregates instead.
+    pub quiet_runs: bool,
     pub checkpoint_path: Option<PathBuf>,
     /// Called once per turn, if a live display is attached. It gets the search
     /// itself as well, so a single-threaded driver can redraw (and poll keys)
@@ -139,6 +222,29 @@ pub struct Search {
     eventbuf: VecDeque<String>,
     /// Object numbers to names, for the display only; see `labels`.
     labels: Labels,
+    /// The object the player controls, once known. Used to keep NPC moves out
+    /// of the goal queue: chasing the thief is not something a command can do.
+    player_object: Option<u16>,
+    /// Moves seen this turn, for learning the player object from a room change.
+    turn_moves: Vec<(u16, u16)>,
+    turn_room_changed: bool,
+
+    // --- instrumentation, for `--stats` ---
+    turns_played: u64,
+    useful_turns: u64,
+    state_turns: u64,
+    newtoken_count: u64,
+    state_changes: u64,
+    replay_turns: u64,
+    diverged_turns: u64,
+    goal_games: u64,
+    top10_games: u64,
+    explore_games: u64,
+    replay_credits: usize,
+
+    // --- command templates mined from commands that produced a token ---
+    cmdtemplates: Vec<Vec<String>>,
+    cmdtemplateset: HashSet<String>,
 }
 
 impl Search {
@@ -163,8 +269,10 @@ impl Search {
             w_stable: 1000.0,
             score_decay: 5.0,
             prob_explore: 0.2,
+            prob_template: 0.35,
             verbose,
             log_instructions: false,
+            quiet_runs: false,
             checkpoint_path: None,
             progress: None,
 
@@ -199,6 +307,22 @@ impl Search {
             score: String::new(),
             eventbuf: VecDeque::new(),
             labels: Labels::default(),
+            player_object: None,
+            turn_moves: Vec::new(),
+            turn_room_changed: false,
+            turns_played: 0,
+            useful_turns: 0,
+            state_turns: 0,
+            newtoken_count: 0,
+            state_changes: 0,
+            replay_turns: 0,
+            diverged_turns: 0,
+            goal_games: 0,
+            top10_games: 0,
+            explore_games: 0,
+            replay_credits: 0,
+            cmdtemplates: Vec::new(),
+            cmdtemplateset: HashSet::new(),
         }
     }
 
@@ -300,6 +424,14 @@ impl Search {
     fn learn_labels(&mut self, zm: &Zmachine<TokenUI>) {
         if self.labels.is_empty() {
             self.labels = Labels::from_tree(&zm.get_object_tree().to_string());
+            if self.player_object.is_none() {
+                self.player_object = self.labels.player();
+                if self.player_object.is_some() {
+                    // Ambient goals may already be queued from a checkpoint;
+                    // the queue is rebuilt without them.
+                    self.reindex();
+                }
+            }
         }
     }
 
@@ -330,6 +462,105 @@ impl Search {
     /// The object table, once a game has run and the story could be read.
     pub fn labels(&self) -> &Labels {
         &self.labels
+    }
+
+    /// The player object, once it is known.
+    pub fn player_object(&self) -> Option<u16> {
+        self.player_object
+    }
+
+    /// True when a token is a state change we cannot control: a move by any
+    /// object other than the player (NPCs, mostly). It stays in the statistics
+    /// and the display, but never becomes a goal.
+    pub fn is_ambient(&self, id: TokenId) -> bool {
+        let player = match self.player_object {
+            Some(player) => player,
+            None => return false,
+        };
+        match move_parts(self.tokens.name(id)) {
+            // A move into the player's own inventory is player-driven even
+            // when the object is not: taking the egg is a goal, the thief
+            // wandering off is not.
+            Some((object, parent)) => object != player && parent != player,
+            None => false,
+        }
+    }
+
+    /// Everything `--stats` needs. Cheap: one pass over the token table.
+    pub fn metrics(&self) -> Metrics {
+        let mut negative_priorities = 0;
+        let mut never_targeted = 0;
+        let mut path_total = 0usize;
+        let mut path_count = 0usize;
+        for id in self.stat_ids() {
+            let stat = self.stat(id);
+            if stat
+                .priority
+                .as_ref()
+                .is_some_and(|score| score.value < 0.0)
+            {
+                negative_priorities += 1;
+            }
+            if stat.goalruns == 0 {
+                never_targeted += 1;
+            }
+            if let Some(best) = &stat.best {
+                path_total += best.len();
+                path_count += 1;
+            }
+        }
+        Metrics {
+            plays: self.numplays,
+            turns: self.turns_played,
+            tokens: self.token_count(),
+            stable: self.stable_count(),
+            newtokens: self.newtoken_count,
+            useful_turns: self.useful_turns,
+            state_turns: self.state_turns,
+            state_changes: self.state_changes,
+            replay_turns: self.replay_turns,
+            diverged_turns: self.diverged_turns,
+            goal_games: self.goal_games,
+            top10_games: self.top10_games,
+            explore_games: self.explore_games,
+            negative_priorities,
+            never_targeted,
+            avg_path_len: if path_count == 0 {
+                0.0
+            } else {
+                path_total as f64 / path_count as f64
+            },
+        }
+    }
+
+    /// Monotonic counters for the parallel coordinator to aggregate.
+    pub fn run_counters(&self) -> RunCounters {
+        RunCounters {
+            turns: self.turns_played,
+            useful_turns: self.useful_turns,
+            state_turns: self.state_turns,
+            newtokens: self.newtoken_count,
+            state_changes: self.state_changes,
+            replay_turns: self.replay_turns,
+            diverged_turns: self.diverged_turns,
+            goal_games: self.goal_games,
+            top10_games: self.top10_games,
+            explore_games: self.explore_games,
+        }
+    }
+
+    /// Fold worker counters into this search.
+    pub fn add_run_counters(&mut self, counters: &RunCounters) {
+        self.turns_played = self.turns_played.saturating_add(counters.turns);
+        self.useful_turns = self.useful_turns.saturating_add(counters.useful_turns);
+        self.state_turns = self.state_turns.saturating_add(counters.state_turns);
+        self.newtoken_count = self.newtoken_count.saturating_add(counters.newtokens);
+        self.state_changes = self.state_changes.saturating_add(counters.state_changes);
+        self.replay_turns = self.replay_turns.saturating_add(counters.replay_turns);
+        self.diverged_turns = self.diverged_turns.saturating_add(counters.diverged_turns);
+        self.goal_games = self.goal_games.saturating_add(counters.goal_games);
+        self.top10_games = self.top10_games.saturating_add(counters.top10_games);
+        self.explore_games = self.explore_games.saturating_add(counters.explore_games);
     }
 
     // --- checkpoint plumbing (checkpoint.rs uses these) ---
@@ -513,22 +744,41 @@ impl Search {
         self.playthru = Playthrough::new();
         self.room.clear();
         self.score.clear();
+        self.turn_moves.clear();
+        self.turn_room_changed = false;
+        self.replay_credits = 0;
 
         // Pick a goal from the ten most attractive tokens, except for the
         // exploration quota: some games deliberately target a token outside
         // the top ten so the queue cannot be monopolised by a few hard goals.
-        let candidates: Vec<TokenId> = self.tokfreq.iter().take(10).map(|s| s.token).collect();
+        let candidates: Vec<TokenId> = self
+            .tokfreq
+            .iter()
+            .take(10)
+            .map(|s| s.token)
+            .filter(|&id| !self.is_ambient(id))
+            .collect();
         let explore = !candidates.is_empty() && self.rng.chance(self.prob_explore);
         let explored = if explore {
             self.exploration_goal(&candidates)
         } else {
             None
         };
+        let used_explore = explored.is_some();
         self.goaltok = match explored {
             Some(goal) => Some(goal),
             None if candidates.is_empty() => None,
             None => Some(candidates[self.rng.below(candidates.len())]),
         };
+
+        if self.goaltok.is_some() {
+            self.goal_games += 1;
+            if used_explore {
+                self.explore_games += 1;
+            } else {
+                self.top10_games += 1;
+            }
+        }
 
         if let Some(goal) = self.goaltok {
             if let Some(rec) = self.stats.get_mut(&goal) {
@@ -551,6 +801,7 @@ impl Search {
                     && stat.first < FIRST_UNKNOWN
                     && !self.stabletoks.contains(id)
                     && !exclude.contains(id)
+                    && !self.is_ambient(**id)
             })
             .map(|(&id, stat)| (stat.goalruns, stat.first, id))
             .collect();
@@ -597,12 +848,41 @@ impl Search {
             self.apply_event(event);
         }
         if let Some((room, score)) = zm.ui.status() {
+            let room_changed = !self.room.is_empty() && room != self.room;
+            if room_changed {
+                self.turn_room_changed = true;
+                self.learn_player_from_move(room);
+            }
             self.room.clear();
             self.room.push_str(room);
             self.score.clear();
             self.score.push_str(score);
         }
         self.report_progress();
+    }
+
+    /// If the object table did not name the player, infer it from the room
+    /// change: the mover whose destination names the new status-bar room is
+    /// the avatar. Only does anything while the player is still unknown.
+    fn learn_player_from_move(&mut self, room: &str) {
+        if self.player_object.is_some() || self.turn_moves.is_empty() {
+            return;
+        }
+        let mut candidate = None;
+        for &(object, parent) in &self.turn_moves {
+            let name = match self.labels.plain_object(parent) {
+                Some(name) => name,
+                None => continue,
+            };
+            if name.eq_ignore_ascii_case(room.trim()) {
+                candidate = Some(object);
+                break;
+            }
+        }
+        if let Some(player) = candidate {
+            self.player_object = Some(player);
+            self.reindex();
+        }
     }
 
     /// Hand this turn to the live display, if one is attached. Token names are
@@ -637,6 +917,7 @@ impl Search {
     fn apply_event(&mut self, event: VmEvent) {
         match event {
             VmEvent::Move { object, parent } => {
+                self.turn_moves.push((object, parent));
                 self.setstate(format!("@mv_{}", object), parent);
             }
             VmEvent::Store { variable, value } => {
@@ -660,6 +941,7 @@ impl Search {
     fn setstate(&mut self, key: String, value: u16) {
         // `usevmstate` is off in search.js, so this only ever logs a token.
         if self.usetech {
+            self.state_changes += 1;
             self.logtoken(&format!("{}_{}", key, value));
         }
     }
@@ -742,6 +1024,7 @@ impl Search {
 
         if !self.stats.contains_key(&id) {
             self.stats.insert(id, Stat::new(cmd.clone()));
+            self.newtoken_count += 1;
             let name = self.token_label(id);
             self.info(format!("NEWTOKEN {} {}", name, cmd));
         }
@@ -761,8 +1044,18 @@ impl Search {
             Some(g) => g,
             None => return,
         };
+        if !self.stats.contains_key(&goal) {
+            return;
+        }
+        self.credit_success(goal);
+        self.goalmet = true;
+    }
 
-        let stablecount = match self.stats.get_mut(&goal) {
+    /// Record one verified success for `id` and promote or demote it once the
+    /// stable threshold is crossed. Shared by the chosen goal and by the
+    /// positive credit a verified replay gives to goals on its prefix.
+    fn credit_success(&mut self, id: TokenId) {
+        let stablecount = match self.stats.get_mut(&id) {
             Some(rec) => {
                 rec.goalsucc += 1;
                 rec.stablecount += 1;
@@ -770,17 +1063,53 @@ impl Search {
             }
             None => return,
         };
-        let first = self.stats[&goal].first;
+        let first = self.stats[&id].first;
         // A token first seen late needs more successes before it counts as
         // stable; early tokens settle quickly.
         let thresh = self.stablethresh as f64 * (first as f64 + 1.0);
 
         if stablecount as f64 >= thresh {
-            self.makestable(goal);
+            self.makestable(id);
         } else if (stablecount as f64) < thresh / 2.0 {
-            self.makeunstable(goal);
+            self.makeunstable(id);
         }
-        self.goalmet = true;
+    }
+
+    /// A verified replay precedes the goal: every token first discovered on one
+    /// of its turns was reproduced too, so one successful run can retire many
+    /// goals. Only intentional replay turns count, and only a bounded number
+    /// per game, so cheap parser responses cannot be inflated.
+    fn credit_replay_bundle(&mut self) {
+        if self.replaydiverged || self.replay_credits >= MAX_REPLAY_CREDITS {
+            return;
+        }
+        let goal = match self.goaltok {
+            Some(goal) => goal,
+            None => return,
+        };
+        let reached = self.numturns.max(0) as usize;
+        let replays: Vec<Vec<TokenId>> = self
+            .playthru
+            .turns
+            .iter()
+            .filter(|turn| turn.replay)
+            .map(|turn| turn.toks.clone())
+            .collect();
+        for toks in replays {
+            for token in toks {
+                if token == goal || self.replay_credits >= MAX_REPLAY_CREDITS {
+                    continue;
+                }
+                let eligible = match self.stats.get(&token) {
+                    Some(stat) => stat.first > 0 && stat.first <= reached,
+                    None => false,
+                };
+                if eligible {
+                    self.credit_success(token);
+                    self.replay_credits += 1;
+                }
+            }
+        }
     }
 
     fn makestable(&mut self, id: TokenId) {
@@ -810,7 +1139,7 @@ impl Search {
             .stableorder
             .iter()
             .copied()
-            .filter(|&id| self.tokens.name(id).starts_with("@mv_"))
+            .filter(|&id| self.tokens.name(id).starts_with("@mv_") && !self.is_ambient(id))
             .collect();
     }
 
@@ -830,6 +1159,19 @@ impl Search {
     /// of attempts since `maxscore` last improved, so one lucky scored run
     /// cannot pin a token to the top of the queue forever.
     fn updatetokfreq(&mut self, id: TokenId) {
+        // Ambient state (NPC moves) is not actionable by a command, so it
+        // never belongs in the goal queue. Drop any stale entry.
+        if self.is_ambient(id) {
+            let old = self
+                .stats
+                .get_mut(&id)
+                .and_then(|stat| stat.priority.take());
+            if let Some(old) = old {
+                self.tokfreq.remove(&old);
+            }
+            return;
+        }
+
         let stable = self.stabletoks.contains(&id);
 
         let (priority, old) = match self.stats.get_mut(&id) {
@@ -889,9 +1231,11 @@ impl Search {
 
         // Did a sequential replay reproduce the tokens recorded for its turn?
         if self.turnisreplay {
+            self.replay_turns += 1;
             if let Some(expected) = &self.expectedtoks {
                 if !sametokens(&self.turntoks, expected) {
                     self.replaydiverged = true;
+                    self.diverged_turns += 1;
                     self.info(format!(
                         "DIVERGE {} {} expected {} got {}",
                         self.numturns,
@@ -904,14 +1248,40 @@ impl Search {
         }
         self.expectedtoks = None;
 
-        if let Some(goal) = self.goaltok {
-            if self.turntokseen.contains(&goal) {
-                self.metgoal();
+        let goal_hit = self
+            .goaltok
+            .is_some_and(|goal| self.turntokseen.contains(&goal));
+        if goal_hit {
+            self.metgoal();
+            if self.turnisreplay {
+                self.credit_replay_bundle();
             }
         }
 
         if self.turncmd.is_some() {
+            self.turns_played += 1;
             let index = self.playthru.len() as isize - 1;
+            // A parser error also prints text, so "produced a token" is not
+            // enough: a command is useful when it changed state, changed rooms,
+            // or revealed text for the first time.
+            let state_token = self
+                .turntoks
+                .iter()
+                .any(|&tok| self.tokens.name(tok).starts_with('@'));
+            let new_token = self.turntoks.iter().any(|&tok| {
+                self.stats
+                    .get(&tok)
+                    .is_some_and(|stat| stat.first > index as usize)
+            });
+            if state_token {
+                self.state_turns += 1;
+            }
+            if self.turn_room_changed || state_token || new_token {
+                self.useful_turns += 1;
+                if let Some(cmd) = self.turncmd.clone() {
+                    self.record_template(&cmd);
+                }
+            }
 
             for tok in self.turntoks.clone() {
                 let mut reduced = false;
@@ -960,7 +1330,29 @@ impl Search {
 
         self.turntoks.clear();
         self.turntokseen.clear();
+        self.turn_moves.clear();
+        self.turn_room_changed = false;
         self.numturns += 1;
+    }
+
+    /// Remember a command that changed something. Commands are stored as word
+    /// vectors so a mutation can replace one slot without knowing grammar.
+    fn record_template(&mut self, cmd: &str) {
+        let words: Vec<String> = cmd.split_whitespace().map(|w| w.to_string()).collect();
+        if words.is_empty() || words.len() > 4 {
+            return;
+        }
+        let key = words.join(" ");
+        if self.cmdtemplateset.insert(key) {
+            if self.cmdtemplates.len() >= TEMPLATE_POOL {
+                // Replace an arbitrary entry; the reservoir does not need to be
+                // uniform, only to keep following new discoveries.
+                let index = self.rng.below(self.cmdtemplates.len());
+                let old = self.cmdtemplates.swap_remove(index);
+                self.cmdtemplateset.remove(&old.join(" "));
+            }
+            self.cmdtemplates.push(words);
+        }
     }
 
     // ------------------------------------------------------------- commands
@@ -985,27 +1377,24 @@ impl Search {
     }
 
     fn getrandomcmd(&mut self) -> String {
+        // Mined commands first: they tend to be grammatical, which is the
+        // difference between a parser error and an actual state change.
+        if !self.cmdtemplates.is_empty() && self.rng.chance(self.prob_template) {
+            if let Some(cmd) = self.template_cmd() {
+                return cmd;
+            }
+        }
+
         loop {
             let mut cmd = String::new();
             for i in 0..2 {
                 if i > 0 {
                     cmd.push(' ');
                 }
-
-                // Prefer words we have actually seen the game understand.
-                let recent = !self.playvocab.is_empty() && self.rng.chance(self.prob_vocab);
-                let word = if recent {
-                    let i = self.rng.below(self.playvocab.len());
-                    self.playvocab[i]
-                } else {
-                    match &self.vocab {
-                        Some(vocab) if !vocab.is_empty() => {
-                            let i = self.rng.below(vocab.len());
-                            vocab[i]
-                        }
-                        // No dictionary: nothing sensible to type.
-                        _ => return "look".to_string(),
-                    }
+                let word = match self.sample_word() {
+                    Some(word) => word,
+                    // No dictionary: nothing sensible to type.
+                    None => return "look".to_string(),
                 };
                 cmd.push_str(self.tokens.name(word));
 
@@ -1017,6 +1406,54 @@ impl Search {
             if !IGNORED_WORDS.contains(&cmd.as_str()) {
                 return cmd;
             }
+        }
+    }
+
+    /// One command word, preferring words the game has actually understood.
+    fn sample_word(&mut self) -> Option<TokenId> {
+        let recent = !self.playvocab.is_empty() && self.rng.chance(self.prob_vocab);
+        if recent {
+            let i = self.rng.below(self.playvocab.len());
+            return Some(self.playvocab[i]);
+        }
+        match &self.vocab {
+            Some(vocab) if !vocab.is_empty() => {
+                let i = self.rng.below(vocab.len());
+                Some(vocab[i])
+            }
+            _ => None,
+        }
+    }
+
+    /// Take a command that worked and mutate one slot. This is the cheap half
+    /// of a contextual command model: no grammar, just the shapes the story has
+    /// already accepted.
+    fn template_cmd(&mut self) -> Option<String> {
+        if self.cmdtemplates.is_empty() {
+            return None;
+        }
+        let index = self.rng.below(self.cmdtemplates.len());
+        let mut words = self.cmdtemplates[index].clone();
+
+        if self.rng.chance(0.75) && !words.is_empty() {
+            let slot = self.rng.below(words.len());
+            if let Some(word) = self.sample_word() {
+                words[slot] = self.tokens.name(word).to_string();
+            }
+        }
+        if words.len() < 4 && self.rng.chance(0.15) {
+            if let Some(word) = self.sample_word() {
+                words.push(self.tokens.name(word).to_string());
+            }
+        } else if words.len() > 1 && self.rng.chance(0.1) {
+            words.pop();
+        }
+
+        let cmd = words.join(" ");
+        if IGNORED_WORDS.contains(&cmd.as_str()) {
+            None
+        } else {
+            Some(cmd)
         }
     }
 
@@ -1189,6 +1626,13 @@ impl Search {
     }
 }
 
+/// Parse an `@mv_<object>_<parent>` token's two object numbers.
+fn move_parts(name: &str) -> Option<(u16, u16)> {
+    let rest = name.strip_prefix("@mv_")?;
+    let (object, parent) = rest.split_once('_')?;
+    Some((object.parse().ok()?, parent.parse().ok()?))
+}
+
 fn sametokens(actual: &[TokenId], expected: &[TokenId]) -> bool {
     if actual.len() != expected.len() {
         return false;
@@ -1268,6 +1712,47 @@ mod tests {
     fn alpha_runs_split_on_non_letters() {
         let runs: Vec<&str> = alpha_runs("take the lamp, 2x").collect();
         assert_eq!(runs, vec!["take", "the", "lamp", "x"]);
+    }
+
+    #[test]
+    fn ambient_moves_never_become_goals() {
+        let mut search = Search::new(Vec::new(), 1, 10, false);
+        search.labels = Labels::from_tree("├── you (30)\n├── Thief (112)\n");
+        search.player_object = search.labels.player();
+        assert_eq!(search.player_object, Some(30));
+
+        let mut stats = HashMap::new();
+        for (name, first) in [
+            ("@mv_30_28", 1),
+            ("@mv_112_57", 1),
+            ("@mv_175_30", 1),
+            ("printed text", 2),
+        ] {
+            let id = search.tokens.intern(name).0;
+            let mut stat = Stat::new("x".to_string());
+            stat.first = first;
+            stats.insert(id, stat);
+        }
+        search.set_stats(stats);
+        search.reindex();
+
+        let names: Vec<String> = search
+            .goal_queue()
+            .into_iter()
+            .map(|(_, id)| search.token_name(id).to_string())
+            .collect();
+        assert!(names.contains(&"@mv_30_28".to_string()), "player move kept");
+        assert!(
+            !names.contains(&"@mv_112_57".to_string()),
+            "thief move excluded"
+        );
+        assert!(names.contains(&"printed text".to_string()), "text kept");
+        assert!(
+            names.contains(&"@mv_175_30".to_string()),
+            "item taken into inventory kept"
+        );
+        let thief = search.tokens.get("@mv_112_57").unwrap();
+        assert!(search.is_ambient(thief));
     }
 
     #[test]
